@@ -1,19 +1,21 @@
 # Single node: one container, SQLite on a volume, in-process cache.
 # Perfect for a laptop or home-lab PC.   docker compose up -d --build
 services:
-  eurofish:
+  stravall:
     build: .
-    image: eurofish:latest
+    image: stravall:latest
     restart: unless-stopped
     ports:
-      - "${EUROFISH_PORT:-8080}:8080"
+      - "${STRAVALL_PORT:-8082}:8082"
     environment:
-      EUROFISH_ALLOW_SIGNUP: "${EUROFISH_ALLOW_SIGNUP:-true}"
-      EUROFISH_SIGNUP_CIDRS: "${EUROFISH_SIGNUP_CIDRS:-}"
-      EUROFISH_COOKIE_SECURE: "${EUROFISH_COOKIE_SECURE:-false}"
-      EUROFISH_SESSION_TTL: "${EUROFISH_SESSION_TTL:-720h}"
+      STRAVALL_GOOGLE_MAPS_KEY: "${STRAVALL_GOOGLE_MAPS_KEY:-}"
+      STRAVALL_MAX_UPLOAD_MB: "${STRAVALL_MAX_UPLOAD_MB:-512}"
+      STRAVALL_ALLOW_SIGNUP: "${STRAVALL_ALLOW_SIGNUP:-true}"
+      STRAVALL_SIGNUP_CIDRS: "${STRAVALL_SIGNUP_CIDRS:-}"
+      STRAVALL_COOKIE_SECURE: "${STRAVALL_COOKIE_SECURE:-false}"
+      STRAVALL_SESSION_TTL: "${STRAVALL_SESSION_TTL:-720h}"
     volumes:
-      - eurofish-data:/data
+      - stravall-data:/data
 
 volumes:
-  eurofish-data:
+  stravall-data:

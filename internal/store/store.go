@@ -5,27 +5,17 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
 
-	"eurofish/internal/db"
-	"eurofish/internal/finance"
+	"stravall/internal/db"
 )
 
 var (
 	ErrNotFound = errors.New("not found")
 	ErrConflict = errors.New("already exists")
-
-	// ErrNotOccurrence is returned when a date is not an occurrence of a
-	// repeating transaction.
-	ErrNotOccurrence = errors.New("not an occurrence of this repeating transaction")
-)
-
-const (
-	RoleOwner  = "owner"
-	RoleEditor = "editor"
-	RoleViewer = "viewer"
 )
 
 type User struct {
@@ -36,41 +26,23 @@ type User struct {
 	CreatedAt    int64  `json:"created_at"`
 }
 
-type Calendar struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Currency     string `json:"currency"`
-	StartDate    string `json:"start_date"`
-	StartBalance int64  `json:"start_balance"`
-	OwnerID      string `json:"owner_id"`
-	OwnerName    string `json:"owner_name"` // display name of the owner
-	Version      int64  `json:"version"`
-	CreatedAt    int64  `json:"created_at"`
-	Role         string `json:"role"` // role of the requesting user
-}
-
-type Member struct {
-	UserID      string `json:"user_id"`
-	Email       string `json:"email"`
-	DisplayName string `json:"display_name"`
-	Role        string `json:"role"`
-}
-
-type Event struct {
-	ID         string   `json:"id"`
-	CalendarID string   `json:"calendar_id"`
-	Title      string   `json:"title"`
-	Amount     int64    `json:"amount"` // cents; positive = income, negative = expense
-	Category   string   `json:"category"`
-	Note       string   `json:"note"`
-	StartDate  string   `json:"start_date"`
-	Recurrence string   `json:"recurrence"`
-	Interval   int      `json:"interval"` // X for "repeat every X weeks" (1 otherwise)
-	UntilDate  string   `json:"until_date,omitempty"`
-	CreatedBy  string   `json:"created_by"`
-	CreatedAt  int64    `json:"created_at"`
-	UpdatedAt  int64    `json:"updated_at"`
-	Skips      []string `json:"skips"`
+// Activity is one stored activity. Stats, Detail, Track and Preview are JSON
+// documents produced by the track package; they are passed through verbatim.
+type Activity struct {
+	ID           string          `json:"id"`
+	UserID       string          `json:"-"`
+	Name         string          `json:"name"`
+	Sport        string          `json:"sport"`
+	SourceFormat string          `json:"format"`
+	FileName     string          `json:"file_name"`
+	ContentHash  string          `json:"-"`
+	StartTime    int64           `json:"start_time"` // unix seconds, 0 = unknown
+	HasTrack     bool            `json:"has_track"`
+	Stats        json.RawMessage `json:"stats"`
+	Detail       json.RawMessage `json:"detail,omitempty"`
+	Track        json.RawMessage `json:"track,omitempty"`
+	Preview      json.RawMessage `json:"preview,omitempty"`
+	CreatedAt    int64           `json:"created_at"`
 }
 
 type Store struct {
@@ -91,14 +63,6 @@ func isDuplicate(err error) bool {
 
 func nullable(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: s != ""}
-}
-
-// intervalOrOne stores 1 for transactions without an explicit interval.
-func intervalOrOne(n int) int {
-	if n < 1 {
-		return 1
-	}
-	return n
 }
 
 // ---------- users ----------
@@ -130,11 +94,6 @@ func (s *Store) scanUser(row *sql.Row) (*User, error) {
 func (s *Store) UserByEmail(ctx context.Context, email string) (*User, error) {
 	return s.scanUser(s.db.QueryRowContext(ctx,
 		`SELECT id, email, display_name, password_hash, created_at FROM users WHERE email = ?`, email))
-}
-
-func (s *Store) UserByID(ctx context.Context, id string) (*User, error) {
-	return s.scanUser(s.db.QueryRowContext(ctx,
-		`SELECT id, email, display_name, password_hash, created_at FROM users WHERE id = ?`, id))
 }
 
 // ---------- sessions ----------
@@ -179,184 +138,149 @@ func (s *Store) DeleteExpiredSessions(ctx context.Context) (int64, error) {
 	return res.RowsAffected()
 }
 
-// ---------- calendars ----------
+// ---------- activities ----------
 
-func (s *Store) CreateCalendar(ctx context.Context, c *Calendar) error {
+// Insert outcomes.
+const (
+	Inserted  = "imported"
+	Duplicate = "duplicate"
+	Upgraded  = "updated" // a summary-only activity (from activities.csv) got its GPS track
+)
+
+// duplicateWindow: activities of one user starting within this many seconds
+// of each other are treated as the same activity (e.g. the same run uploaded
+// as GPX and as FIT, or a row of activities.csv and its file).
+const duplicateWindow = 60
+
+// InsertActivity stores a new activity unless it is already there. It
+// returns the outcome and the id of the stored (or existing) activity.
+func (s *Store) InsertActivity(ctx context.Context, a *Activity) (string, string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO calendars (id, name, currency, start_date, start_balance, owner_id, version, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
-		c.ID, c.Name, c.Currency, c.StartDate, c.StartBalance, c.OwnerID, c.CreatedAt); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO calendar_members (calendar_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`,
-		c.ID, c.OwnerID, RoleOwner, c.CreatedAt); err != nil {
-		return err
-	}
-	c.Version = 1
-	c.Role = RoleOwner
-	return tx.Commit()
-}
 
-// ImportCalendar creates a calendar owned by c.OwnerID together with its
-// transactions (including removed days) and manually set balances, all in
-// one transaction: either everything is imported or nothing.
-func (s *Store) ImportCalendar(ctx context.Context, c *Calendar, events []Event, balances []BalanceOverride) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	var id string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM activities WHERE user_id = ? AND content_hash = ?`, a.UserID, a.ContentHash).Scan(&id)
+	if err == nil {
+		return Duplicate, id, nil
 	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO calendars (id, name, currency, start_date, start_balance, owner_id, version, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
-		c.ID, c.Name, c.Currency, c.StartDate, c.StartBalance, c.OwnerID, c.CreatedAt); err != nil {
-		return err
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", "", err
 	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO calendar_members (calendar_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`,
-		c.ID, c.OwnerID, RoleOwner, c.CreatedAt); err != nil {
-		return err
-	}
-	for _, e := range events {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO events (id, calendar_id, title, amount, category, note, start_date, recurrence, repeat_interval, until_date, created_by, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			e.ID, c.ID, e.Title, e.Amount, e.Category, e.Note, e.StartDate, e.Recurrence, intervalOrOne(e.Interval),
-			nullable(e.UntilDate), e.CreatedBy, e.CreatedAt, e.UpdatedAt); err != nil {
-			return err
-		}
-		for _, d := range e.Skips {
+
+	if a.StartTime > 0 {
+		var hasTrack int
+		err = tx.QueryRowContext(ctx,
+			`SELECT id, has_track FROM activities WHERE user_id = ? AND start_time BETWEEN ? AND ?
+			  ORDER BY has_track DESC, created_at LIMIT 1`,
+			a.UserID, a.StartTime-duplicateWindow, a.StartTime+duplicateWindow).Scan(&id, &hasTrack)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// a new activity
+		case err != nil:
+			return "", "", err
+		case hasTrack == 0 && a.HasTrack:
+			// The existing entry only has Strava's summary: add the route,
+			// keeping the name and type given on Strava.
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO event_skips (event_id, skip_date) VALUES (?, ?)`, e.ID, d); err != nil {
-				return err
+				`UPDATE activities SET source_format = ?, file_name = ?, content_hash = ?, has_track = 1,
+				        stats = ?, detail = ?, track = ?, preview = ? WHERE id = ?`,
+				a.SourceFormat, a.FileName, a.ContentHash, string(a.Stats), string(a.Detail),
+				string(a.Track), string(a.Preview), id); err != nil {
+				if isDuplicate(err) {
+					return Duplicate, id, nil
+				}
+				return "", "", err
 			}
+			return Upgraded, id, tx.Commit()
+		default:
+			return Duplicate, id, nil
 		}
 	}
-	for _, b := range balances {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO balance_overrides (calendar_id, balance_date, balance, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)`,
-			c.ID, b.Date, b.Balance, c.OwnerID, c.CreatedAt); err != nil {
-			return err
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO activities (id, user_id, name, sport, source_format, file_name, content_hash, start_time,
+		                         has_track, stats, detail, track, preview, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.UserID, a.Name, a.Sport, a.SourceFormat, a.FileName, a.ContentHash, a.StartTime,
+		boolInt(a.HasTrack), string(a.Stats), string(a.Detail), string(a.Track), string(a.Preview), a.CreatedAt); err != nil {
+		if isDuplicate(err) {
+			return Duplicate, "", nil
 		}
+		return "", "", err
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	c.Version = 1
-	c.Role = RoleOwner
-	return nil
+	return Inserted, a.ID, tx.Commit()
 }
 
-const calendarCols = `c.id, c.name, c.currency, c.start_date, c.start_balance, c.owner_id, o.display_name, c.version, c.created_at, m.role`
-
-// calendarFrom joins the requesting user's membership and the owner's account.
-const calendarFrom = ` FROM calendars c JOIN calendar_members m ON m.calendar_id = c.id JOIN users o ON o.id = c.owner_id`
-
-func scanCalendar(sc interface{ Scan(...any) error }) (*Calendar, error) {
-	var c Calendar
-	if err := sc.Scan(&c.ID, &c.Name, &c.Currency, &c.StartDate, &c.StartBalance, &c.OwnerID, &c.OwnerName, &c.Version, &c.CreatedAt, &c.Role); err != nil {
-		return nil, err
+func boolInt(b bool) int {
+	if b {
+		return 1
 	}
-	return &c, nil
+	return 0
 }
 
-func (s *Store) ListCalendars(ctx context.Context, userID string) ([]Calendar, error) {
+// ListActivities returns all activities of a user (summary columns only),
+// newest first. withPreview adds the coarse route used by the overview map.
+func (s *Store) ListActivities(ctx context.Context, userID string, withPreview bool) ([]Activity, error) {
+	cols := `id, name, sport, source_format, file_name, start_time, has_track, stats, created_at`
+	if withPreview {
+		cols += `, preview`
+	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+calendarCols+calendarFrom+`
-		  WHERE m.user_id = ? ORDER BY c.created_at, c.id`, userID)
+		`SELECT `+cols+` FROM activities WHERE user_id = ? ORDER BY start_time DESC, created_at DESC, id`, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []Calendar{}
+	out := []Activity{}
 	for rows.Next() {
-		c, err := scanCalendar(rows)
-		if err != nil {
+		var a Activity
+		var hasTrack int
+		var stats, preview string
+		dest := []any{&a.ID, &a.Name, &a.Sport, &a.SourceFormat, &a.FileName, &a.StartTime, &hasTrack, &stats, &a.CreatedAt}
+		if withPreview {
+			dest = append(dest, &preview)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
-		out = append(out, *c)
+		a.HasTrack = hasTrack != 0
+		a.Stats = json.RawMessage(stats)
+		if withPreview {
+			a.Preview = json.RawMessage(preview)
+		}
+		out = append(out, a)
 	}
 	return out, rows.Err()
 }
 
-// CalendarForUser returns the calendar if the user is a member of it.
-func (s *Store) CalendarForUser(ctx context.Context, calendarID, userID string) (*Calendar, error) {
-	c, err := scanCalendar(s.db.QueryRowContext(ctx,
-		`SELECT `+calendarCols+calendarFrom+`
-		  WHERE c.id = ? AND m.user_id = ?`, calendarID, userID))
+// GetActivity returns one activity of a user with all details and the route.
+func (s *Store) GetActivity(ctx context.Context, userID, id string) (*Activity, error) {
+	var a Activity
+	var hasTrack int
+	var stats, detail, track string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, sport, source_format, file_name, start_time, has_track, stats, detail, track, created_at
+		   FROM activities WHERE id = ? AND user_id = ?`, id, userID).
+		Scan(&a.ID, &a.Name, &a.Sport, &a.SourceFormat, &a.FileName, &a.StartTime, &hasTrack, &stats, &detail, &track, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	return c, err
-}
-
-func (s *Store) UpdateCalendar(ctx context.Context, c *Calendar) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE calendars SET name = ?, currency = ?, start_date = ?, start_balance = ?, version = version + 1 WHERE id = ?`,
-		c.Name, c.Currency, c.StartDate, c.StartBalance, c.ID)
-	return err
-}
-
-func (s *Store) DeleteCalendar(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM calendars WHERE id = ?`, id)
-	return err
-}
-
-// ---------- members ----------
-
-func (s *Store) ListMembers(ctx context.Context, calendarID string) ([]Member, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT u.id, u.email, u.display_name, m.role FROM calendar_members m JOIN users u ON u.id = m.user_id
-		  WHERE m.calendar_id = ? ORDER BY m.created_at, u.email`, calendarID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []Member{}
-	for rows.Next() {
-		var m Member
-		if err := rows.Scan(&m.UserID, &m.Email, &m.DisplayName, &m.Role); err != nil {
-			return nil, err
-		}
-		out = append(out, m)
-	}
-	return out, rows.Err()
+	a.HasTrack = hasTrack != 0
+	a.Stats, a.Detail, a.Track = json.RawMessage(stats), json.RawMessage(detail), json.RawMessage(track)
+	return &a, nil
 }
 
-func (s *Store) AddMember(ctx context.Context, calendarID, userID, role string) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO calendar_members (calendar_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`,
-		calendarID, userID, role, time.Now().Unix())
-	if isDuplicate(err) {
-		return ErrConflict
-	}
-	return err
-}
-
-func (s *Store) RemoveMember(ctx context.Context, calendarID, userID string) error {
+// UpdateActivity renames an activity and/or changes its sport.
+func (s *Store) UpdateActivity(ctx context.Context, userID, id, name, sport string) error {
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM calendar_members WHERE calendar_id = ? AND user_id = ? AND role <> ?`,
-		calendarID, userID, RoleOwner)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// UpdateMemberRole changes the role of a (non-owner) member.
-func (s *Store) UpdateMemberRole(ctx context.Context, calendarID, userID, role string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE calendar_members SET role = ? WHERE calendar_id = ? AND user_id = ? AND role <> ?`,
-		role, calendarID, userID, RoleOwner)
+		`UPDATE activities SET name = ?, sport = ? WHERE id = ? AND user_id = ?`, name, sport, id, userID)
 	if err != nil {
 		return err
 	}
@@ -364,8 +288,7 @@ func (s *Store) UpdateMemberRole(ctx context.Context, calendarID, userID, role s
 		// MariaDB reports 0 affected rows when nothing changed; double-check existence.
 		var c int
 		if err := s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM calendar_members WHERE calendar_id = ? AND user_id = ? AND role <> ?`,
-			calendarID, userID, RoleOwner).Scan(&c); err != nil {
+			`SELECT COUNT(*) FROM activities WHERE id = ? AND user_id = ?`, id, userID).Scan(&c); err != nil {
 			return err
 		}
 		if c == 0 {
@@ -375,401 +298,29 @@ func (s *Store) UpdateMemberRole(ctx context.Context, calendarID, userID, role s
 	return nil
 }
 
-// ---------- invites (shares for people without an account yet) ----------
-
-// Invite is a pending share for an e-mail address that has no account yet.
-type Invite struct {
-	Email     string `json:"email"`
-	Role      string `json:"role"`
-	CreatedAt int64  `json:"created_at"`
-}
-
-func (s *Store) ListInvites(ctx context.Context, calendarID string) ([]Invite, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT email, role, created_at FROM calendar_invites WHERE calendar_id = ? ORDER BY created_at, email`, calendarID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Invite{}
-	for rows.Next() {
-		var i Invite
-		if err := rows.Scan(&i.Email, &i.Role, &i.CreatedAt); err != nil {
-			return nil, err
+// DeleteActivities removes the given activities of a user; with no ids it
+// removes all of them. It returns how many were deleted.
+func (s *Store) DeleteActivities(ctx context.Context, userID string, ids []string) (int64, error) {
+	if len(ids) == 0 {
+		res, err := s.db.ExecContext(ctx, `DELETE FROM activities WHERE user_id = ?`, userID)
+		if err != nil {
+			return 0, err
 		}
-		out = append(out, i)
+		return res.RowsAffected()
 	}
-	return out, rows.Err()
-}
-
-// SetInvite creates or replaces the pending share of an e-mail address.
-func (s *Store) SetInvite(ctx context.Context, calendarID, email, role, invitedBy string) (*Invite, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM calendar_invites WHERE calendar_id = ? AND email = ?`, calendarID, email); err != nil {
-		return nil, err
-	}
-	inv := &Invite{Email: email, Role: role, CreatedAt: time.Now().Unix()}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO calendar_invites (calendar_id, email, role, invited_by, created_at) VALUES (?, ?, ?, ?, ?)`,
-		calendarID, email, role, invitedBy, inv.CreatedAt); err != nil {
-		return nil, err
-	}
-	return inv, tx.Commit()
-}
-
-func (s *Store) DeleteInvite(ctx context.Context, calendarID, email string) error {
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM calendar_invites WHERE calendar_id = ? AND email = ?`, calendarID, email)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// AcceptInvites turns all pending shares for the user's e-mail address into
-// memberships. It is called when an account is created.
-func (s *Store) AcceptInvites(ctx context.Context, userID, email string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx,
-		`SELECT calendar_id, role FROM calendar_invites WHERE email = ?`, email)
-	if err != nil {
-		return err
-	}
-	type pending struct{ calendarID, role string }
-	var list []pending
-	for rows.Next() {
-		var p pending
-		if err := rows.Scan(&p.calendarID, &p.role); err != nil {
-			rows.Close()
-			return err
+	var total int64
+	for _, id := range ids {
+		res, err := tx.ExecContext(ctx, `DELETE FROM activities WHERE id = ? AND user_id = ?`, id, userID)
+		if err != nil {
+			return 0, err
 		}
-		list = append(list, p)
+		n, _ := res.RowsAffected()
+		total += n
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	now := time.Now().Unix()
-	for _, p := range list {
-		var n int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM calendar_members WHERE calendar_id = ? AND user_id = ?`, p.calendarID, userID).Scan(&n); err != nil {
-			return err
-		}
-		if n == 0 {
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO calendar_members (calendar_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`,
-				p.calendarID, userID, p.role, now); err != nil {
-				return err
-			}
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM calendar_invites WHERE email = ?`, email); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// ---------- events ----------
-
-func (s *Store) ListEvents(ctx context.Context, calendarID string) ([]Event, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, calendar_id, title, amount, category, note, start_date, recurrence, repeat_interval, until_date, created_by, created_at, updated_at
-		   FROM events WHERE calendar_id = ? ORDER BY start_date, created_at, id`, calendarID)
-	if err != nil {
-		return nil, err
-	}
-	out := []Event{}
-	index := map[string]int{}
-	for rows.Next() {
-		var e Event
-		var until sql.NullString
-		if err := rows.Scan(&e.ID, &e.CalendarID, &e.Title, &e.Amount, &e.Category, &e.Note, &e.StartDate,
-			&e.Recurrence, &e.Interval, &until, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		e.UntilDate = until.String
-		e.Skips = []string{}
-		index[e.ID] = len(out)
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
-
-	skipRows, err := s.db.QueryContext(ctx,
-		`SELECT k.event_id, k.skip_date FROM event_skips k JOIN events e ON e.id = k.event_id
-		  WHERE e.calendar_id = ? ORDER BY k.skip_date`, calendarID)
-	if err != nil {
-		return nil, err
-	}
-	defer skipRows.Close()
-	for skipRows.Next() {
-		var id, d string
-		if err := skipRows.Scan(&id, &d); err != nil {
-			return nil, err
-		}
-		if i, ok := index[id]; ok {
-			out[i].Skips = append(out[i].Skips, d)
-		}
-	}
-	return out, skipRows.Err()
-}
-
-func bumpVersion(ctx context.Context, tx *sql.Tx, calendarID string) error {
-	_, err := tx.ExecContext(ctx, `UPDATE calendars SET version = version + 1 WHERE id = ?`, calendarID)
-	return err
-}
-
-func (s *Store) CreateEvent(ctx context.Context, e *Event) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO events (id, calendar_id, title, amount, category, note, start_date, recurrence, repeat_interval, until_date, created_by, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, e.CalendarID, e.Title, e.Amount, e.Category, e.Note, e.StartDate, e.Recurrence, intervalOrOne(e.Interval),
-		nullable(e.UntilDate), e.CreatedBy, e.CreatedAt, e.UpdatedAt); err != nil {
-		return err
-	}
-	if err := bumpVersion(ctx, tx, e.CalendarID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Store) UpdateEvent(ctx context.Context, e *Event) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx,
-		`UPDATE events SET title = ?, amount = ?, category = ?, note = ?, start_date = ?, recurrence = ?, repeat_interval = ?, until_date = ?, updated_at = ?
-		  WHERE id = ? AND calendar_id = ?`,
-		e.Title, e.Amount, e.Category, e.Note, e.StartDate, e.Recurrence, intervalOrOne(e.Interval), nullable(e.UntilDate), e.UpdatedAt,
-		e.ID, e.CalendarID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		// MariaDB reports 0 affected rows when nothing changed; double-check existence.
-		var c int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE id = ? AND calendar_id = ?`, e.ID, e.CalendarID).Scan(&c); err != nil {
-			return err
-		}
-		if c == 0 {
-			return ErrNotFound
-		}
-	}
-	if err := bumpVersion(ctx, tx, e.CalendarID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *Store) DeleteEvent(ctx context.Context, calendarID, eventID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Explicit skip cleanup keeps behaviour identical even if FK enforcement is off.
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM event_skips WHERE event_id IN (SELECT id FROM events WHERE id = ? AND calendar_id = ?)`,
-		eventID, calendarID); err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM events WHERE id = ? AND calendar_id = ?`, eventID, calendarID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	if err := bumpVersion(ctx, tx, calendarID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// ---------- balance overrides ----------
-
-// BalanceOverride is a manually set end-of-day balance for one date.
-type BalanceOverride struct {
-	Date    string `json:"date"`
-	Balance int64  `json:"balance"` // cents
-}
-
-// ListBalanceOverrides returns all manually set balances of a calendar.
-func (s *Store) ListBalanceOverrides(ctx context.Context, calendarID string) ([]BalanceOverride, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT balance_date, balance FROM balance_overrides WHERE calendar_id = ? ORDER BY balance_date`, calendarID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []BalanceOverride{}
-	for rows.Next() {
-		var b BalanceOverride
-		if err := rows.Scan(&b.Date, &b.Balance); err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
-}
-
-// SetBalanceOverride sets (or replaces) the end-of-day balance of a date.
-func (s *Store) SetBalanceOverride(ctx context.Context, calendarID, date string, balance int64, userID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Delete + insert keeps the SQL portable between SQLite and MariaDB.
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM balance_overrides WHERE calendar_id = ? AND balance_date = ?`, calendarID, date); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO balance_overrides (calendar_id, balance_date, balance, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		calendarID, date, balance, userID, time.Now().Unix()); err != nil {
-		return err
-	}
-	if err := bumpVersion(ctx, tx, calendarID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// DeleteBalanceOverride removes a manually set balance.
-func (s *Store) DeleteBalanceOverride(ctx context.Context, calendarID, date string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx,
-		`DELETE FROM balance_overrides WHERE calendar_id = ? AND balance_date = ?`, calendarID, date)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	if err := bumpVersion(ctx, tx, calendarID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// SkipOccurrence removes a single occurrence of a (recurring) event.
-func (s *Store) SkipOccurrence(ctx context.Context, calendarID, eventID, date string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var n int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE id = ? AND calendar_id = ?`, eventID, calendarID).Scan(&n); err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM event_skips WHERE event_id = ? AND skip_date = ?`, eventID, date).Scan(&n); err != nil {
-		return err
-	}
-	if n == 0 {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO event_skips (event_id, skip_date) VALUES (?, ?)`, eventID, date); err != nil {
-			return err
-		}
-	}
-	if err := bumpVersion(ctx, tx, calendarID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// DetachOccurrence changes a single occurrence of a repeating event: the
-// occurrence on date is removed from the series and e (a one-off event) is
-// created in its place. Both happen in one transaction.
-func (s *Store) DetachOccurrence(ctx context.Context, calendarID, eventID, date string, e *Event) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var startDate, recurrence string
-	var interval int
-	var until sql.NullString
-	err = tx.QueryRowContext(ctx,
-		`SELECT start_date, recurrence, repeat_interval, until_date FROM events WHERE id = ? AND calendar_id = ?`,
-		eventID, calendarID).Scan(&startDate, &recurrence, &interval, &until)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return err
-	}
-	if recurrence == finance.None || recurrence == "" {
-		return ErrNotOccurrence
-	}
-	start, err := finance.ParseDate(startDate)
-	if err != nil {
-		return err
-	}
-	day, err := finance.ParseDate(date)
-	if err != nil {
-		return ErrNotOccurrence
-	}
-	var untilDate time.Time
-	if until.Valid && until.String != "" {
-		if untilDate, err = finance.ParseDate(until.String); err != nil {
-			return err
-		}
-	}
-	if len(finance.OccurrencesEvery(start, untilDate, recurrence, interval, day, day)) == 0 {
-		return ErrNotOccurrence
-	}
-	var n int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM event_skips WHERE event_id = ? AND skip_date = ?`, eventID, date).Scan(&n); err != nil {
-		return err
-	}
-	if n > 0 {
-		return ErrNotOccurrence // already removed from the series
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO event_skips (event_id, skip_date) VALUES (?, ?)`, eventID, date); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO events (id, calendar_id, title, amount, category, note, start_date, recurrence, repeat_interval, until_date, created_by, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, calendarID, e.Title, e.Amount, e.Category, e.Note, e.StartDate, e.Recurrence, intervalOrOne(e.Interval),
-		nullable(e.UntilDate), e.CreatedBy, e.CreatedAt, e.UpdatedAt); err != nil {
-		return err
-	}
-	if err := bumpVersion(ctx, tx, calendarID); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return total, tx.Commit()
 }

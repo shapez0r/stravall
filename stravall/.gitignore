@@ -1,7 +1,0 @@
-/bin/
-/data/
-/dist/
-*.db
-*.db-shm
-*.db-wal
-.env

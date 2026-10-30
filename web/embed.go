@@ -1,4 +1,4 @@
-// Package web embeds the browser UI into the eurofish binary so a single
+// Package web embeds the browser UI into the stravall binary so a single
 // executable (or a FROM-scratch container) serves everything.
 package web
 

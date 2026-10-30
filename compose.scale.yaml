@@ -1,14 +1,15 @@
 # Scaled-out stack: N stateless app replicas behind nginx, MariaDB as the
 # shared database and Valkey as the shared cache.
 #   docker compose -f compose.scale.yaml up -d --build
-#   docker compose -f compose.scale.yaml up -d --scale eurofish=5   (then: docker compose -f compose.scale.yaml restart lb)
+#   docker compose -f compose.scale.yaml up -d --scale stravall=5   (then: docker compose -f compose.scale.yaml restart lb)
 services:
   mariadb:
     image: mariadb:11
     restart: unless-stopped
+    command: ["--max-allowed-packet=64M"]
     environment:
-      MARIADB_DATABASE: eurofish
-      MARIADB_USER: eurofish
+      MARIADB_DATABASE: stravall
+      MARIADB_USER: stravall
       MARIADB_PASSWORD: "${MARIADB_PASSWORD:-change-me}"
       MARIADB_ROOT_PASSWORD: "${MARIADB_ROOT_PASSWORD:-change-me-too}"
     volumes:
@@ -29,20 +30,22 @@ services:
       timeout: 3s
       retries: 20
 
-  eurofish:
+  stravall:
     build: .
-    image: eurofish:latest
+    image: stravall:latest
     restart: unless-stopped
     deploy:
       replicas: 3
     environment:
-      EUROFISH_DB_DRIVER: mariadb
-      EUROFISH_DB_DSN: "eurofish:${MARIADB_PASSWORD:-change-me}@tcp(mariadb:3306)/eurofish?charset=utf8mb4"
-      EUROFISH_CACHE_URL: redis://valkey:6379/0
-      EUROFISH_PROXY_HEADER: X-Forwarded-For
-      EUROFISH_ALLOW_SIGNUP: "${EUROFISH_ALLOW_SIGNUP:-true}"
-      EUROFISH_SIGNUP_CIDRS: "${EUROFISH_SIGNUP_CIDRS:-}"
-      EUROFISH_COOKIE_SECURE: "${EUROFISH_COOKIE_SECURE:-false}"
+      STRAVALL_DB_DRIVER: mariadb
+      STRAVALL_DB_DSN: "stravall:${MARIADB_PASSWORD:-change-me}@tcp(mariadb:3306)/stravall?charset=utf8mb4"
+      STRAVALL_CACHE_URL: redis://valkey:6379/0
+      STRAVALL_PROXY_HEADER: X-Forwarded-For
+      STRAVALL_GOOGLE_MAPS_KEY: "${STRAVALL_GOOGLE_MAPS_KEY:-}"
+      STRAVALL_MAX_UPLOAD_MB: "${STRAVALL_MAX_UPLOAD_MB:-512}"
+      STRAVALL_ALLOW_SIGNUP: "${STRAVALL_ALLOW_SIGNUP:-true}"
+      STRAVALL_SIGNUP_CIDRS: "${STRAVALL_SIGNUP_CIDRS:-}"
+      STRAVALL_COOKIE_SECURE: "${STRAVALL_COOKIE_SECURE:-false}"
     depends_on:
       mariadb:
         condition: service_healthy
@@ -53,11 +56,11 @@ services:
     image: nginx:1.27-alpine
     restart: unless-stopped
     ports:
-      - "${EUROFISH_PORT:-8080}:80"
+      - "${STRAVALL_PORT:-8082}:80"
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      eurofish:
+      stravall:
         condition: service_healthy
 
 volumes:

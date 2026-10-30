@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>eurofish — calendar budgeting</title>
+  <title>Stravall — all your routes</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <script src="theme.js"></script>
   <script src="i18n.js"></script>
@@ -15,8 +15,8 @@
   <!-- Sign in / sign up -->
   <main id="auth-view" class="auth" hidden>
     <div class="auth-card">
-      <div class="brand brand-lg"><img src="favicon.svg" alt="" width="40" height="40"><span>eurofish</span></div>
-      <p class="muted" data-i18n="auth.tagline">Plan income and expenses on a calendar and see your balance for every day ahead.</p>
+      <div class="brand brand-lg"><img src="favicon.svg" alt="" width="40" height="40"><span>Stravall</span></div>
+      <p class="muted" data-i18n="auth.tagline">Upload your Strava exports and see all your routes and statistics on one map.</p>
       <div class="tabs" role="tablist">
         <button type="button" role="tab" id="tab-login" class="tab active" aria-selected="true" data-i18n="auth.signIn">Sign in</button>
         <button type="button" role="tab" id="tab-signup" class="tab" aria-selected="false" data-i18n="auth.createAccount">Create account</button>
@@ -50,15 +50,29 @@
   <!-- Application -->
   <div id="app-view" class="app" hidden>
     <aside class="sidebar" id="sidebar">
-      <div class="brand"><img src="favicon.svg" alt="" width="28" height="28"><span>eurofish</span></div>
+      <div class="brand"><img src="favicon.svg" alt="" width="28" height="28"><span>Stravall</span></div>
       <div class="side-section">
         <div class="side-head">
-          <h2 data-i18n="side.calendars">Calendars</h2>
-          <button type="button" class="icon-btn" id="new-calendar" title="New calendar" aria-label="New calendar" data-i18n-attr="title:side.newCalendar;aria-label:side.newCalendar">+</button>
+          <h2 data-i18n="side.activities">Activities</h2>
+          <span id="list-count" class="muted small"></span>
+          <button type="button" class="icon-btn" id="upload-side" title="Upload files" aria-label="Upload files" data-i18n-attr="title:tb.upload;aria-label:tb.upload">+</button>
         </div>
-        <ul id="calendar-list" class="cal-list"></ul>
+        <div class="filters">
+          <input type="search" id="filter-text" placeholder="Search…" aria-label="Search" data-i18n-attr="placeholder:filter.search;aria-label:filter.search">
+          <select id="filter-sport" aria-label="Sport" data-i18n-attr="aria-label:filter.sport"><option value="*" data-i18n="filter.allSports">All sports</option></select>
+          <div class="row tight">
+            <label><span data-i18n="filter.from">From</span> <input type="date" id="filter-from"></label>
+            <label><span data-i18n="filter.to">To</span> <input type="date" id="filter-to"></label>
+          </div>
+          <button type="button" class="btn ghost small" id="filter-clear" hidden data-i18n="filter.clear">Clear filter</button>
+        </div>
+        <ul id="activity-list" class="cal-list act-list"></ul>
       </div>
       <div class="side-section" id="summary"></div>
+      <div class="side-section units-picker">
+        <div class="side-head"><h2 id="units-title" data-i18n="side.units">Units</h2></div>
+        <select id="units-select" aria-labelledby="units-title"></select>
+      </div>
       <div class="side-section theme-picker">
         <div class="side-head"><h2 id="theme-title" data-i18n="side.theme">Theme</h2></div>
         <select id="theme-select" aria-labelledby="theme-title"></select>
@@ -77,117 +91,72 @@
       <header class="toolbar">
         <button type="button" class="icon-btn menu-btn" id="menu-toggle" aria-label="Toggle sidebar" data-i18n-attr="aria-label:tb.toggleSidebar" aria-controls="sidebar" aria-expanded="false">&#9776;</button>
         <div class="month-nav">
-          <button type="button" class="icon-btn" id="prev-month" aria-label="Previous month" data-i18n-attr="aria-label:tb.prevMonth">&#8249;</button>
-          <h1 id="month-title"></h1>
-          <button type="button" class="icon-btn" id="next-month" aria-label="Next month" data-i18n-attr="aria-label:tb.nextMonth">&#8250;</button>
-          <button type="button" class="btn ghost small" id="today" data-i18n="tb.today">Today</button>
+          <h1 id="view-title">All routes</h1>
         </div>
         <div class="toolbar-actions">
-          <button type="button" class="btn ghost small icon-text" id="share-calendar" aria-label="Share" title="Share" data-i18n-attr="aria-label:tb.share;title:tb.share"><svg class="ico" viewBox="0 0 8 8" width="16" height="16" shape-rendering="crispEdges" aria-hidden="true"><rect x="5" y="0" width="3" height="2" fill="currentColor"/><rect x="0" y="3" width="3" height="2" fill="currentColor"/><rect x="5" y="6" width="3" height="2" fill="currentColor"/><rect x="3" y="2" width="2" height="1" fill="currentColor"/><rect x="3" y="5" width="2" height="1" fill="currentColor"/></svg><span class="lbl" data-i18n="tb.share">Share</span></button>
-          <button type="button" class="btn ghost small icon-text" id="edit-calendar" aria-label="Settings" title="Settings" data-i18n-attr="aria-label:tb.settings;title:tb.settings"><svg class="ico" viewBox="0 0 8 8" width="16" height="16" shape-rendering="crispEdges" aria-hidden="true"><rect x="3" y="0" width="2" height="3" fill="currentColor"/><rect x="3" y="5" width="2" height="3" fill="currentColor"/><rect x="2" y="2" width="4" height="1" fill="currentColor"/><rect x="2" y="5" width="4" height="1" fill="currentColor"/><rect x="0" y="3" width="3" height="2" fill="currentColor"/><rect x="5" y="3" width="3" height="2" fill="currentColor"/><rect x="1" y="1" width="1" height="1" fill="currentColor"/><rect x="6" y="1" width="1" height="1" fill="currentColor"/><rect x="1" y="6" width="1" height="1" fill="currentColor"/><rect x="6" y="6" width="1" height="1" fill="currentColor"/></svg><span class="lbl" data-i18n="tb.settings">Settings</span></button>
-          <button type="button" class="btn primary small icon-text" id="add-event" aria-label="Add transaction" title="Add transaction" data-i18n-attr="aria-label:tb.addTransaction;title:tb.addTransaction"><svg class="ico" viewBox="0 0 8 8" width="16" height="16" shape-rendering="crispEdges" aria-hidden="true"><rect x="3" y="1" width="2" height="6" fill="currentColor"/><rect x="1" y="3" width="6" height="2" fill="currentColor"/></svg><span class="lbl" data-i18n="tb.addTransactionLabel">+ Transaction</span></button>
+          <button type="button" class="btn ghost small icon-text" id="show-all" aria-label="All routes" title="All routes" data-i18n-attr="aria-label:view.allRoutes;title:view.allRoutes"><svg class="ico" viewBox="0 0 8 8" width="16" height="16" shape-rendering="crispEdges" aria-hidden="true"><rect x="0" y="0" width="3" height="3" fill="currentColor"/><rect x="5" y="0" width="3" height="3" fill="currentColor"/><rect x="0" y="5" width="3" height="3" fill="currentColor"/><rect x="5" y="5" width="3" height="3" fill="currentColor"/></svg><span class="lbl" data-i18n="view.allRoutes">All routes</span></button>
+          <button type="button" class="btn ghost small icon-text" id="toggle-markers" aria-pressed="true" aria-label="Start / finish" title="Start / finish" data-i18n-attr="aria-label:tb.markers;title:tb.markers"><svg class="ico" viewBox="0 0 8 8" width="16" height="16" shape-rendering="crispEdges" aria-hidden="true"><rect x="1" y="0" width="1" height="8" fill="currentColor"/><rect x="2" y="0" width="5" height="1" fill="currentColor"/><rect x="2" y="1" width="2" height="2" fill="currentColor"/><rect x="5" y="1" width="2" height="2" fill="currentColor"/><rect x="2" y="3" width="5" height="1" fill="currentColor"/></svg><span class="lbl" data-i18n="tb.markers">Start / finish</span></button>
+          <button type="button" class="btn primary small icon-text" id="upload-btn" aria-label="Upload files" title="Upload files" data-i18n-attr="aria-label:tb.upload;title:tb.upload"><svg class="ico" viewBox="0 0 8 8" width="16" height="16" shape-rendering="crispEdges" aria-hidden="true"><rect x="3" y="1" width="2" height="5" fill="currentColor"/><rect x="2" y="2" width="4" height="1" fill="currentColor"/><rect x="1" y="3" width="1" height="1" fill="currentColor"/><rect x="6" y="3" width="1" height="1" fill="currentColor"/><rect x="0" y="7" width="8" height="1" fill="currentColor"/></svg><span class="lbl" data-i18n="tb.uploadLabel">+ Upload</span></button>
         </div>
       </header>
+
       <div id="empty-state" class="empty" hidden>
-        <h2 data-i18n="empty.title">Create your first calendar</h2>
-        <p class="muted" data-i18n="empty.text">A calendar holds a starting balance and the money that comes in and goes out.</p>
-        <button type="button" class="btn primary" id="empty-create" data-i18n="empty.create">Create calendar</button>
-        <button type="button" class="btn ghost" id="empty-import" data-i18n="empty.import">Import from file&hellip;</button>
+        <h2 data-i18n="empty.title">Upload your Strava activities</h2>
+        <p class="muted" data-i18n="empty.text">Request your archive on strava.com (Settings → My Account → Download or Delete Your Account → Request your archive) and upload the .zip as it is — or single GPX, TCX, FIT, CSV or XML files.</p>
+        <button type="button" class="btn primary" id="empty-upload" data-i18n="empty.upload">Upload files&hellip;</button>
+        <p class="muted small" data-i18n="empty.drop">You can also drop files anywhere on this page.</p>
       </div>
-      <div id="calendar" class="calendar" aria-live="polite">
-        <div class="weekdays" id="weekdays"></div>
-        <div class="grid" id="grid"></div>
+
+      <div id="content" class="content" hidden>
+        <div class="map-wrap">
+          <div id="map" class="map" hidden></div>
+          <canvas id="pixel-map" class="map pixel-map" aria-label="Map of the routes" data-i18n-attr="aria-label:map.label"></canvas>
+          <p id="map-note" class="map-note" hidden></p>
+          <div id="map-legend" class="legend" hidden></div>
+        </div>
+        <div class="stats-panel" id="stats-panel" aria-live="polite">
+          <section id="selected" class="panel selected" hidden></section>
+          <section id="combined" class="panel"></section>
+        </div>
       </div>
     </section>
   </div>
 
-  <!-- Transaction dialog -->
-  <dialog id="event-dialog">
-    <form id="event-form" method="dialog" novalidate>
-      <h2 id="event-dialog-title" data-i18n="ev.new">New transaction</h2>
-      <div class="seg" role="radiogroup" aria-label="Type" data-i18n-attr="aria-label:ev.type">
-        <label><input type="radio" name="kind" value="expense" checked><span data-i18n="ev.expense">Expense</span></label>
-        <label><input type="radio" name="kind" value="income"><span data-i18n="ev.income">Income</span></label>
-      </div>
-      <label><span data-i18n="ev.title">Title</span> <input name="title" maxlength="200" required></label>
-      <div class="row row-pair">
-        <label><span data-i18n="ev.amount">Amount</span> <input name="amount" inputmode="decimal" placeholder="0.00" required></label>
-        <label><span data-i18n="ev.category">Category</span> <input name="category" maxlength="64" list="categories"></label>
-      </div>
-      <datalist id="categories"></datalist>
-      <div class="row">
-        <label><span data-i18n="ev.date">Date</span> <input name="start_date" type="date" required></label>
-        <label><span data-i18n="ev.repeat">Repeat</span>
-          <select name="recurrence">
-            <option value="none" data-i18n="rec.none">Never</option>
-            <option value="daily" data-i18n="rec.daily">Daily</option>
-            <option value="weekly" data-i18n="rec.weekly">Weekly</option>
-            <option value="biweekly" data-i18n="rec.biweekly">Every 2 weeks</option>
-            <option value="weeks" data-i18n="rec.weeks">Every X weeks</option>
-            <option value="monthly" data-i18n="rec.monthly">Monthly</option>
-            <option value="monthly_day" data-i18n="rec.monthly_day">Monthly on this day number</option>
-            <option value="monthly_nth" data-i18n="rec.monthly_nth">Monthly on this weekday (e.g. first Monday)</option>
-            <option value="quarterly" data-i18n="rec.quarterly">Quarterly</option>
-            <option value="yearly" data-i18n="rec.yearly">Yearly</option>
-          </select>
-        </label>
-      </div>
-      <label id="interval-field" hidden><span data-i18n="ev.interval">Repeat every X weeks</span>
-        <span class="interval-input"><input name="interval" type="number" inputmode="numeric" min="1" max="520" step="1" value="1" aria-describedby="interval-unit"><span id="interval-unit" data-i18n="ev.weeksUnit">weeks</span></span>
-      </label>
-      <label id="until-field"><span data-i18n="ev.until">Repeat until (optional)</span> <input name="until_date" type="date"></label>
-      <label><span data-i18n="ev.note">Note</span> <textarea name="note" rows="2" maxlength="2000"></textarea></label>
-      <p id="event-error" class="error" role="alert" hidden></p>
-      <div class="dialog-actions">
-        <button type="button" class="btn danger ghost" id="event-delete" hidden data-i18n="ev.delete">Delete</button>
-        <button type="button" class="btn ghost" id="event-skip" hidden data-i18n="ev.skip">Remove this day only</button>
-        <span class="spacer"></span>
-        <button type="button" class="btn ghost" data-close data-i18n="common.cancel">Cancel</button>
-        <button type="submit" class="btn primary" data-i18n="common.save">Save</button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- Edit a repeating transaction: this day only or all repeats -->
-  <dialog id="scope-dialog">
+  <!-- Upload dialog -->
+  <dialog id="upload-dialog">
     <div class="dialog-body">
-      <h2 data-i18n="scope.title">Edit repeating transaction</h2>
-      <p id="scope-text" class="muted" data-i18n="scope.default">Apply your changes to this day only, or to all repeats?</p>
-      <p id="scope-hint" class="muted small" hidden data-i18n="scope.hint">The repeat settings were changed, so the changes can only be applied to all repeats.</p>
+      <h2 data-i18n="upload.title">Upload activities</h2>
+      <div id="drop-zone" class="drop-zone" role="button" tabindex="0">
+        <strong data-i18n="upload.drop">Drop files here or click to choose</strong>
+        <span class="muted small" data-i18n="upload.formats">GPX, TCX, FIT, CSV, XML — also .gz and the complete Strava export .zip</span>
+      </div>
+      <p class="muted small" data-i18n="upload.help">Uploading the same activity again is detected and skipped. Rows of activities.csv without a GPS file are kept as statistics-only activities.</p>
+      <p id="upload-limit" class="muted small"></p>
+      <div id="upload-progress" class="upload-progress" hidden>
+        <progress id="upload-bar" max="1" value="0"></progress>
+        <p id="upload-label" class="small" aria-live="polite"></p>
+      </div>
+      <ul id="upload-results" class="upload-results"></ul>
       <div class="dialog-actions">
-        <button type="button" class="btn ghost" data-close data-i18n="common.cancel">Cancel</button>
+        <button type="button" class="btn danger ghost" id="delete-all" hidden data-i18n="upload.deleteAll">Delete all activities…</button>
+        <button type="button" class="btn danger ghost" id="delete-filtered" hidden data-i18n="upload.deleteFiltered">Delete filtered…</button>
         <span class="spacer"></span>
-        <button type="button" class="btn" id="scope-one" data-i18n="scope.one">This day only</button>
-        <button type="button" class="btn primary" id="scope-all" data-i18n="scope.all">All repeats</button>
+        <button type="button" class="btn ghost" data-close data-i18n="common.close">Close</button>
+        <button type="button" class="btn primary" id="upload-choose" data-i18n="upload.choose">Choose files…</button>
       </div>
     </div>
   </dialog>
 
-  <!-- Day dialog -->
-  <dialog id="day-dialog">
-    <div class="dialog-body">
-      <h2 id="day-title"></h2>
-      <p id="day-balance" class="muted"></p>
-      <ul id="day-entries" class="entry-list"></ul>
+  <!-- Edit activity -->
+  <dialog id="edit-dialog">
+    <form id="edit-form" method="dialog" novalidate>
+      <h2 data-i18n="edit.title">Edit activity</h2>
+      <label><span data-i18n="edit.name">Name</span> <input name="name" maxlength="200" required></label>
+      <label><span data-i18n="edit.sport">Sport</span> <input name="sport" maxlength="64" list="sports"></label>
+      <datalist id="sports"></datalist>
+      <p id="edit-error" class="error" role="alert" hidden></p>
       <div class="dialog-actions">
-        <span class="spacer"></span>
-        <button type="button" class="btn ghost" id="day-set-balance" data-i18n="day.setBalance">Set balance</button>
-        <button type="button" class="btn ghost" data-close data-i18n="common.close">Close</button>
-        <button type="button" class="btn primary" id="day-add" data-i18n="day.add">+ Transaction</button>
-      </div>
-    </div>
-  </dialog>
-
-  <!-- Set balance on a specific day -->
-  <dialog id="balance-dialog">
-    <form id="balance-form" method="dialog" novalidate>
-      <h2 data-i18n="bal.title">Balance on this day</h2>
-      <p id="balance-day" class="muted"></p>
-      <label><span data-i18n="bal.label">End-of-day balance</span> <input name="balance" inputmode="decimal" placeholder="0.00" required></label>
-      <p class="muted small" data-i18n="bal.help">Transactions on this day are already included. The following days continue from this amount.</p>
-      <p id="balance-error" class="error" role="alert" hidden></p>
-      <div class="dialog-actions">
-        <button type="button" class="btn danger ghost" id="balance-clear" hidden data-i18n="bal.clear">Remove set balance</button>
+        <button type="button" class="btn danger ghost" id="edit-delete" data-i18n="edit.delete">Delete</button>
         <span class="spacer"></span>
         <button type="button" class="btn ghost" data-close data-i18n="common.cancel">Cancel</button>
         <button type="submit" class="btn primary" data-i18n="common.save">Save</button>
@@ -195,70 +164,9 @@
     </form>
   </dialog>
 
-  <!-- Calendar settings dialog -->
-  <dialog id="calendar-dialog">
-    <form id="calendar-form" method="dialog" novalidate>
-      <h2 id="calendar-dialog-title" data-i18n="cal.new">New calendar</h2>
-      <label><span data-i18n="cal.name">Name</span> <input name="name" maxlength="100" required></label>
-      <div class="row">
-        <label><span data-i18n="cal.currency">Currency</span> <input name="currency" maxlength="3" value="EUR" required></label>
-        <label><span data-i18n="cal.startBalance">Starting balance</span> <input name="start_balance" inputmode="decimal" placeholder="0.00"></label>
-      </div>
-      <label><span data-i18n="cal.balanceDate">Balance date</span> <input name="start_date" type="date" required></label>
-      <p class="muted small" data-i18n="cal.help">The starting balance is what you have on the balance date. Everything after it adds up from there.</p>
-      <p id="calendar-error" class="error" role="alert" hidden></p>
-      <div class="export-box" id="import-box">
-        <h3 data-i18n="cal.importTitle">Import from file</h3>
-        <p class="muted small" data-i18n="cal.importText">Create a calendar from a eurofish .json export (settings, transactions, repeats and set balances).</p>
-        <div class="dialog-actions">
-          <button type="button" class="btn ghost" id="import-choose" data-i18n="cal.importChoose">Choose .json file&hellip;</button>
-        </div>
-      </div>
-      <div class="dialog-actions">
-        <button type="button" class="btn danger ghost" id="calendar-delete" hidden data-i18n="cal.delete">Delete calendar</button>
-        <span class="spacer"></span>
-        <button type="button" class="btn ghost" data-close data-i18n="common.cancel">Cancel</button>
-        <button type="submit" class="btn primary" data-i18n="common.save">Save</button>
-      </div>
-    </form>
-  </dialog>
+  <input type="file" id="upload-file" multiple accept=".gpx,.tcx,.fit,.csv,.xml,.zip,.gz,application/gpx+xml,application/zip,text/csv,text/xml,application/xml" hidden>
 
-  <!-- Share dialog -->
-  <dialog id="share-dialog">
-    <form id="share-form" method="dialog" novalidate>
-      <h2 data-i18n="share.title">Share calendar</h2>
-      <p class="muted small" data-i18n="share.text">Add people by e-mail. If they do not have a eurofish account on this server yet, the calendar appears for them as soon as they sign up with that address.</p>
-      <ul id="member-list" class="member-list"></ul>
-      <div id="share-add" class="row">
-        <label><span data-i18n="share.email">E-mail</span> <input name="email" type="email" required></label>
-        <label><span data-i18n="share.access">Access</span>
-          <select name="role">
-            <option value="editor" data-i18n="share.canEdit">Can edit</option>
-            <option value="viewer" data-i18n="share.canView">Can view</option>
-          </select>
-        </label>
-      </div>
-      <p id="share-error" class="error" role="alert" hidden></p>
-      <div class="export-box">
-        <h3 data-i18n="share.sendTitle">Send as file</h3>
-        <p class="muted small" data-i18n="share.sendText">Export this calendar (settings, transactions, repeats and set balances) as a JSON file, e.g. to send it with Gmail or Telegram.</p>
-        <div class="dialog-actions">
-          <button type="button" class="btn ghost" id="export-share" hidden data-i18n="share.sendFile">Send file&hellip;</button>
-          <button type="button" class="btn ghost" id="export-download" data-i18n="share.download">Download .json</button>
-        </div>
-      </div>
-      <div class="dialog-actions">
-        <span class="spacer"></span>
-        <button type="button" class="btn ghost" data-close data-i18n="common.close">Close</button>
-        <button type="submit" class="btn primary" id="share-submit" data-i18n="share.add">Add person</button>
-      </div>
-    </form>
-  </dialog>
-
-  <input type="file" id="import-file" accept=".json,application/json" hidden>
-
-  <div id="day-menu" class="ctx-menu" role="menu" aria-label="Day actions" data-i18n-attr="aria-label:menu.label" hidden></div>
-
+  <div class="drop-overlay" aria-hidden="true"><span data-i18n="upload.dropHere">Drop to upload</span></div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>
 </html>

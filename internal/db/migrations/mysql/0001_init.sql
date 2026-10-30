@@ -1,6 +1,6 @@
--- eurofish initial schema (MariaDB / MySQL)
--- Money is stored as signed integer cents. Dates are ISO "YYYY-MM-DD" strings.
+-- stravall initial schema (MariaDB / MySQL)
 -- Timestamps are unix seconds. IDs are application-generated UUIDs.
+-- Distances are metres, durations seconds.
 
 CREATE TABLE users (
     id            VARCHAR(36)  NOT NULL PRIMARY KEY,
@@ -11,7 +11,7 @@ CREATE TABLE users (
     UNIQUE KEY uq_users_email (email)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- External identities (Google, Apple, ...) linked to a user. Reserved for upcoming OAuth/OIDC sign-in.
+-- External identities (Google, Apple, Strava ...) linked to a user. Reserved for upcoming OAuth/OIDC sign-in.
 CREATE TABLE auth_identities (
     provider   VARCHAR(32)  NOT NULL,
     subject    VARCHAR(255) NOT NULL,
@@ -32,50 +32,25 @@ CREATE TABLE sessions (
     CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE calendars (
+-- One uploaded activity. stats is a small JSON summary (listed for every
+-- activity), detail holds splits and the elevation profile, track the
+-- simplified route and preview a coarse version of it for the overview map.
+CREATE TABLE activities (
     id            VARCHAR(36)  NOT NULL PRIMARY KEY,
-    name          VARCHAR(100) NOT NULL,
-    currency      VARCHAR(3)   NOT NULL,
-    start_date    VARCHAR(10)  NOT NULL,
-    start_balance BIGINT       NOT NULL,
-    owner_id      VARCHAR(36)  NOT NULL,
-    version       BIGINT       NOT NULL DEFAULT 1,
+    user_id       VARCHAR(36)  NOT NULL,
+    name          VARCHAR(200) NOT NULL,
+    sport         VARCHAR(64)  NOT NULL DEFAULT '',
+    source_format VARCHAR(16)  NOT NULL,
+    file_name     VARCHAR(255) NOT NULL DEFAULT '',
+    content_hash  VARCHAR(64)  NOT NULL,
+    start_time    BIGINT       NOT NULL DEFAULT 0,
+    has_track     TINYINT      NOT NULL DEFAULT 0,
+    stats         MEDIUMTEXT   NOT NULL,
+    detail        MEDIUMTEXT   NOT NULL,
+    track         MEDIUMTEXT   NOT NULL,
+    preview       MEDIUMTEXT   NOT NULL,
     created_at    BIGINT       NOT NULL,
-    CONSTRAINT fk_calendars_owner FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE calendar_members (
-    calendar_id VARCHAR(36) NOT NULL,
-    user_id     VARCHAR(36) NOT NULL,
-    role        VARCHAR(16) NOT NULL,
-    created_at  BIGINT      NOT NULL,
-    PRIMARY KEY (calendar_id, user_id),
-    KEY idx_calendar_members_user (user_id),
-    CONSTRAINT fk_members_calendar FOREIGN KEY (calendar_id) REFERENCES calendars(id) ON DELETE CASCADE,
-    CONSTRAINT fk_members_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE events (
-    id          VARCHAR(36)  NOT NULL PRIMARY KEY,
-    calendar_id VARCHAR(36)  NOT NULL,
-    title       VARCHAR(200) NOT NULL,
-    amount      BIGINT       NOT NULL,
-    category    VARCHAR(64)  NOT NULL DEFAULT '',
-    note        TEXT         NOT NULL,
-    start_date  VARCHAR(10)  NOT NULL,
-    recurrence  VARCHAR(16)  NOT NULL,
-    until_date  VARCHAR(10)  NULL,
-    created_by  VARCHAR(36)  NOT NULL,
-    created_at  BIGINT       NOT NULL,
-    updated_at  BIGINT       NOT NULL,
-    KEY idx_events_calendar (calendar_id),
-    CONSTRAINT fk_events_calendar FOREIGN KEY (calendar_id) REFERENCES calendars(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Single occurrences of a recurring event that were removed ("skip this one").
-CREATE TABLE event_skips (
-    event_id  VARCHAR(36) NOT NULL,
-    skip_date VARCHAR(10) NOT NULL,
-    PRIMARY KEY (event_id, skip_date),
-    CONSTRAINT fk_skips_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+    UNIQUE KEY uq_activities_hash (user_id, content_hash),
+    KEY idx_activities_user_start (user_id, start_time),
+    CONSTRAINT fk_activities_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

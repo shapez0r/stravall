@@ -4,5 +4,4 @@
 *.db
 *.db-shm
 *.db-wal
-*.ext4
 .env

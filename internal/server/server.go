@@ -21,14 +21,14 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 
-	"eurofish/internal/cache"
-	"eurofish/internal/config"
-	"eurofish/internal/db"
-	"eurofish/internal/store"
-	"eurofish/web"
+	"stravall/internal/cache"
+	"stravall/internal/config"
+	"stravall/internal/db"
+	"stravall/internal/store"
+	"stravall/web"
 )
 
-const sessionCookie = "eurofish_session"
+const sessionCookie = "stravall_session"
 
 type Server struct {
 	cfg     *config.Config
@@ -51,15 +51,16 @@ func New(cfg *config.Config, database *db.DB, c cache.Cache, log *slog.Logger, v
 	}
 
 	app := fiber.New(fiber.Config{
-		AppName:               "eurofish",
+		AppName:               "stravall",
 		DisableStartupMessage: true,
-		ReadTimeout:           15 * time.Second,
-		WriteTimeout:          30 * time.Second,
-		IdleTimeout:           120 * time.Second,
-		BodyLimit:             1024 * 1024, // calendar imports can be larger than other requests
-		ProxyHeader:           cfg.ProxyHeader,
-		EnableIPValidation:    true,
-		ErrorHandler:          s.errorHandler,
+		// Uploads (e.g. a whole Strava export) can be large and slow.
+		ReadTimeout:        10 * time.Minute,
+		WriteTimeout:       5 * time.Minute,
+		IdleTimeout:        120 * time.Second,
+		BodyLimit:          cfg.MaxUploadMB * 1024 * 1024,
+		ProxyHeader:        cfg.ProxyHeader,
+		EnableIPValidation: true,
+		ErrorHandler:       s.errorHandler,
 	})
 	s.app = app
 
@@ -89,35 +90,14 @@ func New(cfg *config.Config, database *db.DB, c cache.Cache, log *slog.Logger, v
 	api.Post("/auth/login", authLimiter, requireJSON, s.login)
 	api.Post("/auth/logout", s.logout)
 
-	priv := api.Group("", s.requireAuth, requireJSON)
+	priv := api.Group("", s.requireAuth, csrfGuard)
 	priv.Get("/me", s.me)
-
-	priv.Get("/calendars", s.listCalendars)
-	priv.Post("/calendars", s.createCalendar)
-	priv.Post("/calendars/import", s.importCalendar)
-	priv.Get("/calendars/:id", s.getCalendar)
-	priv.Patch("/calendars/:id", s.updateCalendar)
-	priv.Delete("/calendars/:id", s.deleteCalendar)
-
-	priv.Get("/calendars/:id/members", s.listMembers)
-	priv.Post("/calendars/:id/members", s.addMember)
-	priv.Patch("/calendars/:id/members/:userId", s.updateMember)
-	priv.Delete("/calendars/:id/members/:userId", s.removeMember)
-	priv.Get("/calendars/:id/invites", s.listInvites)
-	priv.Delete("/calendars/:id/invites/:email", s.deleteInvite)
-
-	priv.Get("/calendars/:id/events", s.listEvents)
-	priv.Post("/calendars/:id/events", s.createEvent)
-	priv.Put("/calendars/:id/events/:eventId", s.updateEvent)
-	priv.Delete("/calendars/:id/events/:eventId", s.deleteEvent)
-	priv.Post("/calendars/:id/events/:eventId/skip", s.skipOccurrence)
-	priv.Post("/calendars/:id/events/:eventId/occurrence", s.updateOccurrence)
-
-	priv.Get("/calendars/:id/balances", s.listBalances)
-	priv.Put("/calendars/:id/balances/:date", s.setBalance)
-	priv.Delete("/calendars/:id/balances/:date", s.deleteBalance)
-	priv.Get("/calendars/:id/ledger", s.ledger)
-	priv.Get("/calendars/:id/export", s.exportCalendar)
+	priv.Get("/activities", s.listActivities)
+	priv.Post("/activities/upload", s.uploadActivity)
+	priv.Post("/activities/delete", s.deleteActivities)
+	priv.Get("/activities/:id", s.getActivity)
+	priv.Patch("/activities/:id", s.updateActivity)
+	priv.Delete("/activities/:id", s.deleteActivity)
 
 	api.Use(func(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "unknown API endpoint")
@@ -144,12 +124,12 @@ func New(cfg *config.Config, database *db.DB, c cache.Cache, log *slog.Logger, v
 		Index:        "index.html",
 		NotFoundFile: "index.html",
 	}))
-
 	return s
 }
 
 func (s *Server) Listen() error {
-	s.log.Info("eurofish listening", "addr", s.cfg.Addr, "db", string(s.db.Dialect), "cache", s.cache.Name(), "version", s.version)
+	s.log.Info("stravall listening", "addr", s.cfg.Addr, "db", string(s.db.Dialect), "cache", s.cache.Name(),
+		"google_maps", s.cfg.GoogleMapsKey != "", "max_upload_mb", s.cfg.MaxUploadMB, "version", s.version)
 	return s.app.Listen(s.cfg.Addr)
 }
 
@@ -177,9 +157,7 @@ func (s *Server) RunJanitor(ctx context.Context) {
 
 // versionedIndex returns index.html with "?v=<content hash>" appended to the
 // script (theme.js, i18n.js, app.js) and app.css links, so browsers load the
-// new UI right after an update. i18n.js must be versioned too: a stale cached
-// copy lacks newly added translations, and the UI would then show raw keys
-// such as "auth.passwordConfirm" instead of the text.
+// new UI right after an update.
 func versionedIndex(ui fs.FS) []byte {
 	page, err := fs.ReadFile(ui, "index.html")
 	if err != nil {
@@ -203,11 +181,23 @@ func versionedIndex(ui fs.FS) []byte {
 
 // ---------- middleware & helpers ----------
 
+// contentSecurityPolicy allows the Google Maps JavaScript API (scripts,
+// tiles, fonts and the styles it injects) in addition to the app itself.
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self' https://*.googleapis.com https://*.gstatic.com *.google.com https://*.ggpht.com *.googleusercontent.com blob:; " +
+	"img-src 'self' data: blob: https://*.googleapis.com https://*.gstatic.com *.google.com *.googleusercontent.com; " +
+	"frame-src *.google.com; " +
+	"connect-src 'self' https://*.googleapis.com *.google.com https://*.gstatic.com data: blob:; " +
+	"font-src 'self' https://fonts.gstatic.com; " +
+	"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+	"worker-src blob:; " +
+	"frame-ancestors 'none'"
+
 func securityHeaders(c *fiber.Ctx) error {
 	c.Set("X-Content-Type-Options", "nosniff")
 	c.Set("X-Frame-Options", "DENY")
 	c.Set("Referrer-Policy", "same-origin")
-	c.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'")
+	c.Set("Content-Security-Policy", contentSecurityPolicy)
 	return c.Next()
 }
 
@@ -216,16 +206,30 @@ func noStore(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-// requireJSON rejects state-changing requests that are not JSON. Together with
-// the SameSite session cookie this blocks cross-site form (CSRF) submissions.
+func isJSON(c *fiber.Ctx) bool {
+	return strings.HasPrefix(strings.ToLower(c.Get(fiber.HeaderContentType)), fiber.MIMEApplicationJSON)
+}
+
+// requireJSON rejects state-changing requests that are not JSON (sign-in and
+// sign-up). Together with the SameSite session cookie this blocks cross-site
+// form (CSRF) submissions.
 func requireJSON(c *fiber.Ctx) error {
 	switch c.Method() {
 	case fiber.MethodPost, fiber.MethodPut, fiber.MethodPatch:
-		if !strings.HasPrefix(strings.ToLower(c.Get(fiber.HeaderContentType)), fiber.MIMEApplicationJSON) {
+		if !isJSON(c) {
 			return fiber.NewError(fiber.StatusUnsupportedMediaType, "content type must be application/json")
 		}
-	case fiber.MethodDelete:
-		if c.Get("X-Requested-With") == "" && !strings.HasPrefix(strings.ToLower(c.Get(fiber.HeaderContentType)), fiber.MIMEApplicationJSON) {
+	}
+	return c.Next()
+}
+
+// csrfGuard requires state-changing requests to be JSON or to carry the
+// X-Requested-With header (file uploads send the raw file). Browsers only send
+// either cross-site after a CORS preflight, which this server never allows.
+func csrfGuard(c *fiber.Ctx) error {
+	switch c.Method() {
+	case fiber.MethodPost, fiber.MethodPut, fiber.MethodPatch, fiber.MethodDelete:
+		if c.Get("X-Requested-With") == "" && !isJSON(c) {
 			return fiber.NewError(fiber.StatusBadRequest, "missing X-Requested-With header")
 		}
 	}
@@ -239,6 +243,9 @@ func (s *Server) errorHandler(c *fiber.Ctx, err error) error {
 	switch {
 	case errors.As(err, &fe):
 		code, msg = fe.Code, fe.Message
+		if code == fiber.StatusRequestEntityTooLarge {
+			msg = "the file is too large"
+		}
 	case errors.Is(err, store.ErrNotFound):
 		code, msg = fiber.StatusNotFound, "not found"
 	case errors.Is(err, store.ErrConflict):
@@ -271,5 +278,7 @@ func (s *Server) getConfig(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"signup_enabled": s.cfg.SignupAllowedFrom(c.IP()),
 		"version":        s.version,
+		"maps_key":       s.cfg.GoogleMapsKey,
+		"max_upload_mb":  s.cfg.MaxUploadMB,
 	})
 }

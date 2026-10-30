@@ -1,4 +1,4 @@
-// eurofish colour themes. Loaded synchronously in <head> (before the page is
+// stravall colour themes. Loaded synchronously in <head> (before the page is
 // drawn) so a chosen theme is applied without a flash of the default colours.
 // The choice is remembered in this browser (localStorage).
 (() => {
@@ -14,7 +14,7 @@
     { id: "purple", label: "Purple", group: "Dark" },
     { id: "rose-night", label: "Rose night", group: "Dark" },
   ];
-  const KEY = "eurofish.theme";
+  const KEY = "stravall.theme";
   const valid = (id) => THEMES.some((t) => t.id === id);
 
   function get() {
@@ -38,5 +38,5 @@
   }
 
   apply(get());
-  window.EurofishTheme = { list: THEMES, get, set };
+  window.StravallTheme = { list: THEMES, get, set };
 })();

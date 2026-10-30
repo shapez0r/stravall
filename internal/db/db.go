@@ -100,13 +100,13 @@ func (db *DB) Migrate(ctx context.Context) error {
 
 	if db.Dialect == MySQL {
 		var got sql.NullInt64
-		if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK('eurofish_migrate', 120)").Scan(&got); err != nil {
+		if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK('stravall_migrate', 120)").Scan(&got); err != nil {
 			return fmt.Errorf("acquire migration lock: %w", err)
 		}
 		if !got.Valid || got.Int64 != 1 {
 			return fmt.Errorf("could not acquire migration lock")
 		}
-		defer conn.ExecContext(context.Background(), "SELECT RELEASE_LOCK('eurofish_migrate')")
+		defer conn.ExecContext(context.Background(), "SELECT RELEASE_LOCK('stravall_migrate')")
 	}
 
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (

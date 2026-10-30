@@ -1,43 +1,29 @@
-// eurofish web UI — dependency-free vanilla JavaScript.
+// stravall web UI — dependency-free vanilla JavaScript.
 (() => {
   "use strict";
 
   const $ = (sel) => document.querySelector(sel);
   // Translations and the UI locale (system language by default) live in i18n.js.
-  const I18N = window.EurofishI18n;
+  const I18N = window.StravallI18n;
   const t = I18N.t;
   const tn = I18N.tn;
-  // Every date and amount is formatted with the UI language's locale, so the
-  // month and weekday names always match the rest of the UI.
   const loc = () => I18N.locale();
-  const fmtDate = (d, opts) => d.toLocaleDateString(loc(), opts);
-  const LONG_DATE = { weekday: "long", day: "numeric", month: "long", year: "numeric" };
-  // Monday-first weekday names in the UI language (2024-01-01 was a Monday).
-  function weekdayNames() {
-    return Array.from({ length: 7 }, (_, i) => fmtDate(new Date(2024, 0, 1 + i), { weekday: "short" }));
-  }
-  const RECURRENCE_LABEL = {
-    none: "", daily: "daily", weekly: "weekly", biweekly: "every 2 weeks", weeks: "every X weeks",
-    monthly: "monthly", quarterly: "quarterly", yearly: "yearly",
-    monthly_day: "monthly on this day number", monthly_nth: "monthly on this weekday",
-  };
 
   const state = {
     user: null,
-    calendars: [],
-    calendar: null,
-    month: firstOfMonth(new Date()),
-    ledger: null,
-    events: new Map(),
+    config: { maps_key: "", max_upload_mb: 512, signup_enabled: false },
     authMode: "login",
-    signupEnabled: false,
-    editing: null, // { event, occurrenceDate }
-    dayOpen: null,
-    balanceDate: null, // day whose balance is being set
-    pendingSave: null, // edit of a repeating transaction waiting for "this day only" / "all repeats"
-    slide: 0, // direction of the next month-change animation
-    swipeIn: 0, // direction of a swipe whose new month still has to scroll in
-    swiping: false, // a swipe month change is animating
+    activities: [], // summaries (+ coarse preview route) of every activity
+    byId: new Map(),
+    filtered: [],
+    selectedId: null,
+    details: new Map(), // id -> full activity (route, splits, profile)
+    units: localStorageGet("units") === "imperial" ? "imperial" : "metric",
+    markers: localStorageGet("markers") !== "off",
+    sort: { key: "date", dir: -1 },
+    listLimit: 200,
+    tableLimit: 200,
+    uploading: false,
   };
 
   // ---------- utilities ----------
@@ -57,103 +43,121 @@
     return el;
   }
 
-  function pad(n) { return String(n).padStart(2, "0"); }
-  function iso(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
-  function parseISO(s) { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); }
-  function firstOfMonth(d) { return new Date(d.getFullYear(), d.getMonth(), 1); }
-  function addDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n); }
-
-  // Whole amounts are shown without ".00".
-  function money(cents, opts = {}) {
-    const currency = state.calendar ? state.calendar.currency : "EUR";
-    const whole = cents % 100 === 0 ? { minimumFractionDigits: 0 } : {};
-    try {
-      return pixelSafe(new Intl.NumberFormat(loc(), { style: "currency", currency, ...whole, ...opts }).format(cents / 100));
-    } catch {
-      return `${plainAmount(cents)} ${currency}`;
-    }
+  // replaceChildren() would print null/false as text; skip them.
+  function setChildren(el, ...nodes) {
+    el.replaceChildren(...nodes.flat().filter((n) => n !== null && n !== undefined && n !== false));
   }
+
+  function localStorageGet(k) { try { return localStorage.getItem(`stravall.${k}`); } catch { return null; } }
+  function localStorageSet(k, v) { try { localStorage.setItem(`stravall.${k}`, v); } catch { /* ignore */ } }
+
+  function pad(n) { return String(n).padStart(2, "0"); }
+  function isoDay(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+  function startDate(a) { return a.start_time ? new Date(a.start_time * 1000) : null; }
+
   // Some locales (and iOS Safari) format with thin/narrow spaces that the pixel
   // font does not have; they would be drawn in a fallback system font.
-  function pixelSafe(s) { return s.replace(/[\u2007\u2009\u202f]/g, "\u00a0"); }
+  function pixelSafe(s) { return String(s).replace(/[\u2007\u2009\u202f]/g, "\u00a0"); }
 
-  // Day cells are narrow on tablets and phones: there the balance is shown
-  // compactly (e.g. "€1.2k", "€850") so it fits in the pixel font.
-  const compactCells = window.matchMedia ? window.matchMedia("(max-width: 1100px)") : null;
-  // Phones: the sidebar is an overlay and every transaction is listed in the
-  // tiny pixel font, with a compact amount on its own line.
-  const narrowScreen = window.matchMedia ? window.matchMedia("(max-width: 820px)") : null;
-  function isNarrow() { return !!(narrowScreen && narrowScreen.matches); }
-  // Phones: transaction names in day cells are cut to 10 characters + "…".
-  function shortTitle(t) {
-    const chars = Array.from(t);
-    return chars.length > 10 ? chars.slice(0, 10).join("") + "…" : t;
+  function num(v, digits = 0) {
+    return pixelSafe(new Intl.NumberFormat(loc(), { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(v));
   }
-  function cellMoney(cents) {
-    if (!compactCells || !compactCells.matches) return money(cents);
-    const abs = Math.abs(cents) / 100;
-    if (abs < 1000) return money(cents, { minimumFractionDigits: 0, maximumFractionDigits: 0 });
-    const [div, suffix] = Math.round(abs / 100) >= 10000 ? [1e6, "M"] : [1e3, "k"];
-    try {
-      const currency = state.calendar ? state.calendar.currency : "EUR";
-      const parts = new Intl.NumberFormat(loc(), { style: "currency", currency, minimumFractionDigits: 0, maximumFractionDigits: 1 })
-        .formatToParts(cents / 100 / div);
-      let last = -1;
-      parts.forEach((p, i) => { if (p.type === "integer" || p.type === "fraction") last = i; });
-      return pixelSafe(parts.map((p, i) => (i === last ? p.value + suffix : p.value)).join(""));
-    } catch {
-      return money(cents);
+
+  const imperial = () => state.units === "imperial";
+
+  function fmtDist(m, digits) {
+    if (!Number.isFinite(m)) m = 0;
+    const v = imperial() ? m / 1609.344 : m / 1000;
+    const d = digits !== undefined ? digits : (v >= 1000 ? 0 : v >= 100 ? 1 : 2);
+    return `${num(v, d)} ${t(imperial() ? "unit.mi" : "unit.km")}`;
+  }
+
+  function fmtEle(m) {
+    const v = imperial() ? m * 3.28084 : m;
+    return `${num(Math.round(v))} ${t(imperial() ? "unit.ft" : "unit.m")}`;
+  }
+
+  function fmtDuration(s) {
+    s = Math.round(s || 0);
+    const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), ss = s % 60;
+    return hh ? `${hh}:${pad(mm)}:${pad(ss)}` : `${mm}:${pad(ss)}`;
+  }
+
+  // Long durations (combined totals): "123 h 04 min".
+  function fmtHours(s) {
+    s = Math.round(s || 0);
+    const hh = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60);
+    return hh ? t("unit.hmin", { h: num(hh), m: pad(mm) }) : t("unit.min", { m: mm });
+  }
+
+  const PACE_SPORTS = new Set(["Run", "Trail Run", "Virtual Run", "Walk", "Hike", "Snowshoe"]);
+  function usesPace(sport) { return PACE_SPORTS.has(sport); }
+
+  function fmtSpeed(ms, sport) {
+    if (!ms || !Number.isFinite(ms)) return "—";
+    if (sport === "Swim") {
+      const per100 = 100 / ms;
+      return `${fmtDuration(per100)} ${t("unit.per100m")}`;
     }
-  }
-
-  // Plain number for input fields, e.g. "1250" or "49.90".
-  function plainAmount(cents) {
-    return cents % 100 === 0 ? String(cents / 100) : (cents / 100).toFixed(2);
-  }
-
-  // Accepts "1234.5", "1,234.50", "1234,50", "1.234,50" and returns cents or NaN.
-  function parseMoney(raw) {
-    let s = String(raw || "").trim().replace(/[\s\u00a0'€$£]/g, "");
-    if (!s) return NaN;
-    const neg = s.startsWith("-");
-    s = s.replace(/^[-+]/, "");
-    const lastSep = Math.max(s.lastIndexOf("."), s.lastIndexOf(","));
-    let intPart = s, frac = "";
-    if (lastSep >= 0 && s.length - lastSep - 1 <= 2) {
-      intPart = s.slice(0, lastSep);
-      frac = s.slice(lastSep + 1);
+    if (usesPace(sport)) {
+      const unit = imperial() ? 1609.344 : 1000;
+      return `${fmtDuration(unit / ms)} ${t(imperial() ? "unit.perMi" : "unit.perKm")}`;
     }
-    intPart = intPart.replace(/[.,]/g, "");
-    if (!/^\d*$/.test(intPart) || !/^\d*$/.test(frac) || (intPart + frac) === "") return NaN;
-    const cents = Number(intPart || "0") * 100 + Number((frac + "00").slice(0, 2));
-    return neg ? -cents : cents;
+    const v = imperial() ? ms * 2.236936 : ms * 3.6;
+    return `${num(v, 1)} ${t(imperial() ? "unit.mph" : "unit.kmh")}`;
   }
 
-  function centsToInput(c) { return plainAmount(Math.abs(c)); }
+  function fmtDate(d, opts) { return d ? pixelSafe(d.toLocaleDateString(loc(), opts)) : "—"; }
+  function fmtDateTime(d) {
+    return d ? pixelSafe(d.toLocaleString(loc(), { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })) : "—";
+  }
+  const SHORT_DATE = { day: "numeric", month: "short", year: "numeric" };
+
+  function sportLabel(s) {
+    if (!s) return t("sport.other");
+    const key = `sport.${s}`;
+    const v = t(key);
+    return v === key ? s : v;
+  }
+
+  const SPORT_COLORS = {
+    "Run": "#ff2e97", "Trail Run": "#d1007a", "Virtual Run": "#ff7ac0",
+    "Ride": "#00b8d9", "Mountain Bike Ride": "#0077b6", "Gravel Ride": "#3a86ff", "E-Bike Ride": "#48cae4", "Virtual Ride": "#90e0ef",
+    "Walk": "#39c96f", "Hike": "#e0a24a", "Swim": "#5468ff", "Alpine Ski": "#b48cff", "Nordic Ski": "#9b6cf0",
+  };
+  const OTHER_COLORS = ["#ff9f1c", "#2ec4b6", "#e71d36", "#8338ec", "#fb5607", "#06d6a0"];
+  function sportColor(sport) {
+    if (SPORT_COLORS[sport]) return SPORT_COLORS[sport];
+    let hsh = 0;
+    for (const ch of String(sport)) hsh = (hsh * 31 + ch.charCodeAt(0)) >>> 0;
+    return OTHER_COLORS[hsh % OTHER_COLORS.length];
+  }
+
+  function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  // True if the current theme is dark (judged by the background colour).
+  function darkTheme() {
+    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(cssVar("--bg"));
+    if (!m) return false;
+    const [r, g, b] = m.slice(1).map((x) => parseInt(x, 16) / 255);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.4;
+  }
 
   let toastTimer;
   function toast(msg) {
-    const t = $("#toast");
-    t.textContent = msg;
-    t.classList.remove("leaving");
-    t.hidden = false;
+    const el = $("#toast");
+    el.textContent = msg;
+    el.classList.remove("leaving");
+    el.hidden = false;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => {
-      t.classList.add("leaving");
-      toastTimer = setTimeout(() => { t.hidden = true; t.classList.remove("leaving"); }, reducedMotion() ? 0 : 200);
-    }, 3000);
+      el.classList.add("leaving");
+      toastTimer = setTimeout(() => { el.hidden = true; el.classList.remove("leaving"); }, reducedMotion() ? 0 : 200);
+    }, 3500);
   }
 
   function reducedMotion() {
     return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-  }
-
-  // Re-triggers a CSS animation class on an element.
-  function animate(el, cls) {
-    if (!el) return;
-    el.classList.remove("slide-next", "slide-prev", "fade");
-    void el.offsetWidth; // restart the animation
-    el.classList.add(cls);
   }
 
   // Dialogs fade/slide out before they actually close.
@@ -162,8 +166,7 @@
     const nativeShow = d.showModal.bind(d);
     let timer = null;
     d.close = (ret) => {
-      if (!d.open) return;
-      if (timer) return;
+      if (!d.open || timer) return;
       if (reducedMotion()) { nativeClose(ret); return; }
       d.classList.add("closing");
       timer = setTimeout(() => {
@@ -176,18 +179,13 @@
       if (timer) { clearTimeout(timer); timer = null; d.classList.remove("closing"); return; }
       nativeShow();
     };
-    // Escape: animate instead of closing instantly.
-    d.addEventListener("cancel", (e) => { e.preventDefault(); d.close(); });
+    d.addEventListener("cancel", (e) => { e.preventDefault(); if (!(d.id === "upload-dialog" && state.uploading)) d.close(); });
   }
 
   function showError(el, msg) { el.textContent = msg || ""; el.hidden = !msg; }
 
   async function api(method, path, body) {
-    const opts = {
-      method,
-      credentials: "same-origin",
-      headers: { "X-Requested-With": "eurofish" },
-    };
+    const opts = { method, credentials: "same-origin", headers: { "X-Requested-With": "stravall" } };
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
@@ -207,21 +205,17 @@
 
   // ---------- auth ----------
 
-  // Eye button in the password field: shows the typed password as plain text
-  // and hides it again.
   function setPasswordVisible(visible) {
     const input = $("#auth-form").password;
     const btn = $("#password-toggle");
-    if (!input || !btn) return;
     input.type = visible ? "text" : "password";
-    // The "repeat password" field (sign-up) is shown or hidden together with it.
-    const confirmInput = $("#auth-form").password_confirm;
-    if (confirmInput) confirmInput.type = input.type;
+    $("#auth-form").password_confirm.type = input.type;
     btn.setAttribute("aria-pressed", String(visible));
     const label = t(visible ? "auth.hidePassword" : "auth.showPassword");
     btn.setAttribute("aria-label", label);
     btn.title = label;
   }
+
   function togglePasswordVisible() {
     const input = $("#auth-form").password;
     const pos = [input.selectionStart, input.selectionEnd];
@@ -229,6 +223,7 @@
     input.focus();
     try { input.setSelectionRange(pos[0], pos[1]); } catch { /* ignore */ }
   }
+
   function setAuthMode(mode) {
     state.authMode = mode;
     const signup = mode === "signup";
@@ -248,9 +243,9 @@
   function showAuth() {
     $("#app-view").hidden = true;
     $("#auth-view").hidden = false;
-    $("#tab-signup").hidden = !state.signupEnabled;
-    $("#signup-disabled").hidden = state.signupEnabled;
-    if (!state.signupEnabled) setAuthMode("login");
+    $("#tab-signup").hidden = !state.config.signup_enabled;
+    $("#signup-disabled").hidden = !!state.config.signup_enabled;
+    if (!state.config.signup_enabled) setAuthMode("login");
     setPasswordVisible(false);
     $("#auth-form").email.focus();
   }
@@ -280,7 +275,10 @@
   async function logout() {
     try { await api("POST", "/auth/logout"); } catch { /* ignore */ }
     state.user = null;
-    state.calendar = null;
+    state.activities = [];
+    state.byId = new Map();
+    state.details.clear();
+    state.selectedId = null;
     showAuth();
   }
 
@@ -290,930 +288,1205 @@
     $("#auth-view").hidden = true;
     $("#app-view").hidden = false;
     $("#me-name").textContent = state.user.display_name;
-    await loadCalendars();
+    MapView.init();
+    await loadActivities();
   }
 
-  async function loadCalendars(selectId) {
-    state.calendars = await api("GET", "/calendars");
-    const wanted = selectId || (state.calendar && state.calendar.id) || localStorageGet("calendar");
-    state.calendar = state.calendars.find((c) => c.id === wanted) || state.calendars[0] || null;
-    renderCalendarList();
-    await refresh();
+  async function loadActivities() {
+    const list = await api("GET", "/activities?preview=1");
+    for (const a of list) {
+      a.stats = a.stats || {};
+      a.preview = Array.isArray(a.preview) ? a.preview : [];
+    }
+    state.activities = list;
+    state.byId = new Map(list.map((a) => [a.id, a]));
+    state.details.clear();
+    if (state.selectedId && !state.byId.has(state.selectedId)) state.selectedId = null;
+    fillSportFilter();
+    applyFilter(true);
   }
 
-  // Calendars shared with the user by someone else show up when the tab is
-  // focused again (no page reload needed).
-  let calendarsCheck = 0;
-  async function checkSharedCalendars() {
-    if (!state.user || $("#app-view").hidden || Date.now() - calendarsCheck < 5000) return;
-    calendarsCheck = Date.now();
-    try {
-      const list = await api("GET", "/calendars");
-      const key = (l) => l.map((c) => `${c.id}:${c.role}:${c.name}:${c.owner_name}`).join("|");
-      if (key(list) === key(state.calendars)) return;
-      if (document.querySelector("dialog[open]")) return; // do not disturb an open dialog
-      await loadCalendars();
-    } catch { /* ignore */ }
+  // ---------- filtering ----------
+
+  function fillSportFilter() {
+    const select = $("#filter-sport");
+    const current = select.value;
+    const counts = new Map();
+    for (const a of state.activities) counts.set(a.sport || "", (counts.get(a.sport || "") || 0) + 1);
+    const sports = [...counts.keys()].sort((x, y) => sportLabel(x).localeCompare(sportLabel(y), loc()));
+    select.replaceChildren(
+      h("option", { value: "*" }, t("filter.allSports")),
+      ...sports.map((s) => h("option", { value: s }, `${sportLabel(s)} (${counts.get(s)})`)));
+    select.value = counts.has(current) || current === "*" ? current : "*";
+    if (!select.value) select.value = "*";
   }
 
-  function localStorageGet(k) { try { return localStorage.getItem(`eurofish.${k}`); } catch { return null; } }
-  function localStorageSet(k, v) { try { localStorage.setItem(`eurofish.${k}`, v); } catch { /* ignore */ } }
+  function readFilter() {
+    return {
+      text: $("#filter-text").value.trim().toLocaleLowerCase(loc()),
+      sport: $("#filter-sport").value || "*",
+      from: $("#filter-from").value,
+      to: $("#filter-to").value,
+    };
+  }
 
-  function renderCalendarList() {
-    const list = $("#calendar-list");
-    list.replaceChildren(...state.calendars.map((c) => h("li", null,
+  function applyFilter(fit) {
+    const f = readFilter();
+    state.filtered = state.activities.filter((a) => {
+      if (f.sport !== "*" && (a.sport || "") !== f.sport) return false;
+      if (f.text && !a.name.toLocaleLowerCase(loc()).includes(f.text) && !(a.file_name || "").toLowerCase().includes(f.text)) return false;
+      if (f.from || f.to) {
+        const d = startDate(a);
+        if (!d) return false;
+        const day = isoDay(d);
+        if (f.from && day < f.from) return false;
+        if (f.to && day > f.to) return false;
+      }
+      return true;
+    });
+    const active = f.text || f.sport !== "*" || f.from || f.to;
+    $("#filter-clear").hidden = !active;
+    state.listLimit = 200;
+    state.tableLimit = 200;
+    render(fit);
+  }
+
+  function clearFilter() {
+    $("#filter-text").value = "";
+    $("#filter-sport").value = "*";
+    $("#filter-from").value = "";
+    $("#filter-to").value = "";
+    applyFilter(true);
+  }
+
+  // ---------- rendering ----------
+
+  function render(fit) {
+    const has = state.activities.length > 0;
+    $("#empty-state").hidden = has;
+    $("#content").hidden = !has;
+    $("#show-all").hidden = !has;
+    $("#toggle-markers").hidden = !has;
+    renderTitle();
+    renderList();
+    renderSidebarSummary();
+    if (!has) { MapView.render([], null, false); return; }
+    renderSelected();
+    renderCombined();
+    MapView.render(state.filtered, state.selectedId, fit);
+  }
+
+  function renderTitle() {
+    const a = state.selectedId && state.byId.get(state.selectedId);
+    $("#view-title").textContent = a ? a.name : t("view.allRoutes");
+    $("#show-all").classList.toggle("active", !a);
+  }
+
+  function renderList() {
+    const list = $("#activity-list");
+    const items = state.filtered.slice(0, state.listLimit).map((a) => h("li", null,
       h("button", {
         type: "button",
-        class: state.calendar && c.id === state.calendar.id ? "active" : "",
-        onclick: () => selectCalendar(c.id),
-        title: c.owner_name ? t("cal.ownedBy", { name: c.name, owner: c.owner_name }) : c.name,
+        class: a.id === state.selectedId ? "active" : "",
+        onclick: () => { closeSidebar(); selectActivity(a.id === state.selectedId ? null : a.id); },
+        title: a.name,
       },
+        h("span", { class: "swatch", style: `background:${sportColor(a.sport)}`, "aria-hidden": "true" }),
         h("span", { class: "cal-name" },
-          h("span", { class: "name" }, c.name),
-          c.owner_name ? h("span", { class: "owner" }, t("cal.by", { owner: c.owner_name })) : null),
-        c.role !== "owner" ? h("span", { class: "role" }, t(`cal.role.${c.role}`)) : null),
-    )));
+          h("span", { class: "name" }, a.name),
+          h("span", { class: "owner" }, `${fmtDate(startDate(a), SHORT_DATE)} · ${fmtDist(a.stats.distance_m)}`)),
+        a.has_track ? null : h("span", { class: "role", title: t("list.noGps") }, t("list.noGpsShort")))));
+    if (state.filtered.length > state.listLimit) {
+      items.push(h("li", null, h("button", { type: "button", class: "more-btn", onclick: () => { state.listLimit += 500; renderList(); } },
+        t("list.more", { n: state.filtered.length - state.listLimit }))));
+    }
+    if (!state.filtered.length && state.activities.length) items.push(h("li", { class: "muted small" }, t("list.noMatch")));
+    list.replaceChildren(...items);
+    $("#list-count").textContent = state.activities.length ? `${num(state.filtered.length)} / ${num(state.activities.length)}` : "";
   }
 
-  async function selectCalendar(id) {
-    state.calendar = state.calendars.find((c) => c.id === id) || null;
-    if (state.calendar) localStorageSet("calendar", state.calendar.id);
-    closeSidebar();
-    renderCalendarList();
-    await refresh();
+  function renderSidebarSummary() {
+    const box = $("#summary");
+    if (!state.activities.length) { setChildren(box, ); return; }
+    const c = combine(state.filtered);
+    const row = (label, value) => [h("dt", null, label), h("dd", null, value)];
+    setChildren(box, 
+      h("div", { class: "side-head" }, h("h2", null, t("sum.title"))),
+      h("dl", { class: "summary-grid" },
+        row(t("stat.activities"), num(c.count)),
+        row(t("stat.distance"), fmtDist(c.distance)),
+        row(t("stat.movingTime"), fmtHours(c.moving)),
+        row(t("stat.ascent"), fmtEle(c.ascent))));
   }
 
-  // ---------- sidebar (overlay on small screens) ----------
+  // ---------- combined statistics ----------
+
+  function combine(list) {
+    const c = {
+      count: list.length, withTrack: 0, distance: 0, moving: 0, elapsed: 0, ascent: 0, descent: 0, calories: 0,
+      hrTime: 0, hrSum: 0, maxHR: 0, maxSpeed: null, days: new Set(), first: null, last: null,
+      bySport: new Map(), byMonth: new Map(), byYear: new Map(), byWeekday: Array.from({ length: 7 }, () => ({ count: 0, distance: 0 })),
+      longest: null, longestTime: null, fastest: null, climb: null, highest: null, streak: 0, points: 0,
+    };
+    const better = (cur, a, v) => (!cur || v > cur.v ? { a, v } : cur);
+    for (const a of list) {
+      const s = a.stats || {};
+      const dist = s.distance_m || 0, moving = s.moving_s || 0;
+      c.distance += dist;
+      c.moving += moving;
+      c.elapsed += s.elapsed_s || 0;
+      c.ascent += s.ascent_m || 0;
+      c.descent += s.descent_m || 0;
+      c.calories += s.calories || 0;
+      c.points += s.points || 0;
+      if (a.has_track) c.withTrack++;
+      if (s.avg_hr && moving) { c.hrSum += s.avg_hr * moving; c.hrTime += moving; }
+      c.maxHR = Math.max(c.maxHR, s.max_hr || 0);
+      if (s.max_speed) c.maxSpeed = better(c.maxSpeed, a, s.max_speed);
+      c.longest = better(c.longest, a, dist);
+      c.longestTime = better(c.longestTime, a, moving);
+      if (dist >= 1000 && s.avg_speed) c.fastest = better(c.fastest, a, s.avg_speed);
+      if (s.ascent_m) c.climb = better(c.climb, a, s.ascent_m);
+      if (s.has_ele) c.highest = better(c.highest, a, s.max_ele);
+
+      const sp = a.sport || "";
+      const bs = c.bySport.get(sp) || { count: 0, distance: 0, moving: 0, ascent: 0 };
+      bs.count++; bs.distance += dist; bs.moving += moving; bs.ascent += s.ascent_m || 0;
+      c.bySport.set(sp, bs);
+
+      const d = startDate(a);
+      if (!d) continue;
+      c.days.add(isoDay(d));
+      if (!c.first || d < c.first) c.first = d;
+      if (!c.last || d > c.last) c.last = d;
+      const mk = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+      const bm = c.byMonth.get(mk) || { count: 0, distance: 0, moving: 0 };
+      bm.count++; bm.distance += dist; bm.moving += moving;
+      c.byMonth.set(mk, bm);
+      const yk = String(d.getFullYear());
+      const by = c.byYear.get(yk) || { count: 0, distance: 0, moving: 0, ascent: 0 };
+      by.count++; by.distance += dist; by.moving += moving; by.ascent += s.ascent_m || 0;
+      c.byYear.set(yk, by);
+      const wd = (d.getDay() + 6) % 7;
+      c.byWeekday[wd].count++;
+      c.byWeekday[wd].distance += dist;
+    }
+    // Longest streak of consecutive active days.
+    const days = [...c.days].sort();
+    let run = 0, prev = null;
+    for (const day of days) {
+      const cur = new Date(`${day}T12:00:00`);
+      run = prev && Math.round((cur - prev) / 86400000) === 1 ? run + 1 : 1;
+      c.streak = Math.max(c.streak, run);
+      prev = cur;
+    }
+    c.avgHR = c.hrTime ? c.hrSum / c.hrTime : 0;
+    c.avgSpeed = c.moving ? c.distance / c.moving : 0;
+    return c;
+  }
+
+  function card(label, value, sub) {
+    return h("div", { class: "card" },
+      h("div", { class: "card-label" }, label),
+      h("div", { class: "card-value" }, value),
+      sub ? h("div", { class: "card-sub" }, sub) : null);
+  }
+
+  function recordRow(label, rec, fmt) {
+    if (!rec || !rec.v) return null;
+    return h("li", null,
+      h("span", { class: "rec-label" }, label),
+      h("button", { type: "button", class: "link", onclick: () => selectActivity(rec.a.id) }, rec.a.name),
+      h("span", { class: "rec-value" }, fmt(rec.v, rec.a)));
+  }
+
+  function commonSport(list) {
+    const s = new Set(list.map((a) => a.sport || ""));
+    return s.size === 1 ? [...s][0] : "";
+  }
+
+  function renderCombined() {
+    const list = state.filtered;
+    const c = combine(list);
+    const sport = commonSport(list);
+    const box = $("#combined");
+    if (!list.length) {
+      setChildren(box, h("h2", null, t("comb.title")), h("p", { class: "muted" }, t("list.noMatch")));
+      return;
+    }
+    const range = c.first ? `${fmtDate(c.first, SHORT_DATE)} – ${fmtDate(c.last, SHORT_DATE)}` : "";
+    const weeks = c.first ? Math.max(1, (c.last - c.first) / (7 * 86400000)) : 1;
+
+    const cards = h("div", { class: "cards" },
+      card(t("stat.activities"), num(c.count), tn("stat.withGps", c.withTrack)),
+      card(t("stat.distance"), fmtDist(c.distance), t("stat.avgPer", { v: fmtDist(c.count ? c.distance / c.count : 0) })),
+      card(t("stat.movingTime"), fmtHours(c.moving), t("stat.elapsedV", { v: fmtHours(c.elapsed) })),
+      card(t("stat.ascent"), fmtEle(c.ascent), t("stat.descentV", { v: fmtEle(c.descent) })),
+      card(t(usesPace(sport) ? "stat.avgPace" : "stat.avgSpeed"), fmtSpeed(c.avgSpeed, sport)),
+      card(t("stat.perWeek"), fmtDist(c.distance / weeks), t("stat.timePerWeek", { v: fmtHours(c.moving / weeks) })),
+      card(t("stat.activeDays"), num(c.days.size), t("stat.streak", { n: num(c.streak) })),
+      c.calories ? card(t("stat.calories"), num(c.calories)) : null,
+      c.avgHR ? card(t("stat.avgHR"), `${num(c.avgHR)} ${t("unit.bpm")}`, t("stat.maxV", { v: `${num(c.maxHR)} ${t("unit.bpm")}` })) : null,
+      card(t("stat.earthLaps"), num(c.distance / 40075017, 3), t("stat.everests", { n: num(c.ascent / 8849, 2) })));
+
+    const records = h("ul", { class: "records" },
+      recordRow(t("rec.longest"), c.longest, (v) => fmtDist(v)),
+      recordRow(t("rec.longestTime"), c.longestTime, (v) => fmtDuration(v)),
+      recordRow(t("rec.fastest"), c.fastest, (v, a) => fmtSpeed(v, a.sport)),
+      recordRow(t("rec.maxSpeed"), c.maxSpeed, (v) => fmtSpeed(v, "")),
+      recordRow(t("rec.climb"), c.climb, (v) => fmtEle(v)),
+      recordRow(t("rec.highest"), c.highest, (v) => fmtEle(v)));
+
+    const sportRows = [...c.bySport.entries()].sort((x, y) => y[1].distance - x[1].distance).map(([sp, v]) => h("tr", null,
+      h("td", null, h("span", { class: "swatch", style: `background:${sportColor(sp)}` }), sportLabel(sp)),
+      h("td", { class: "num" }, num(v.count)),
+      h("td", { class: "num" }, fmtDist(v.distance)),
+      h("td", { class: "num" }, fmtHours(v.moving)),
+      h("td", { class: "num" }, fmtEle(v.ascent))));
+    const sportTable = h("table", { class: "table" },
+      h("thead", null, h("tr", null, h("th", null, t("col.sport")), h("th", { class: "num" }, t("col.count")),
+        h("th", { class: "num" }, t("col.distance")), h("th", { class: "num" }, t("col.time")), h("th", { class: "num" }, t("col.elev")))),
+      h("tbody", null, sportRows));
+
+    const yearRows = [...c.byYear.entries()].sort((x, y) => y[0].localeCompare(x[0])).map(([yr, v]) => h("tr", null,
+      h("td", null, yr), h("td", { class: "num" }, num(v.count)), h("td", { class: "num" }, fmtDist(v.distance)),
+      h("td", { class: "num" }, fmtHours(v.moving)), h("td", { class: "num" }, fmtEle(v.ascent))));
+    const yearTable = yearRows.length ? h("table", { class: "table" },
+      h("thead", null, h("tr", null, h("th", null, t("col.year")), h("th", { class: "num" }, t("col.count")),
+        h("th", { class: "num" }, t("col.distance")), h("th", { class: "num" }, t("col.time")), h("th", { class: "num" }, t("col.elev")))),
+      h("tbody", null, yearRows)) : null;
+
+    setChildren(box, 
+      h("div", { class: "panel-head" }, h("h2", null, t("comb.title")), h("span", { class: "muted small" }, range)),
+      cards,
+      h("h3", null, t("comb.records")), records,
+      h("h3", null, t("comb.bySport")), sportTable,
+      h("h3", null, t("comb.byMonth")), monthBars(c),
+      h("h3", null, t("comb.byWeekday")), weekdayBars(c),
+      yearTable ? h("h3", null, t("comb.byYear")) : null, yearTable,
+      h("h3", null, t("comb.activities")), activityTable());
+  }
+
+  function bars(entries, labelFmt, title) {
+    const max = Math.max(1, ...entries.map((e) => e.value));
+    return h("div", { class: "bars", role: "img", "aria-label": title },
+      entries.map((e) => h("div", { class: "bar", title: `${labelFmt(e)}: ${e.text}` },
+        h("div", { class: "bar-track" },
+          h("div", { class: "bar-fill", style: `height:${Math.max(e.value ? 2 : 0, Math.round((e.value / max) * 100))}%` })),
+        h("div", { class: "bar-label" }, e.short))));
+  }
+
+  function monthBars(c) {
+    if (!c.first) return h("p", { class: "muted small" }, "—");
+    // The last up to 24 months of the selection, gaps included.
+    const end = new Date(c.last.getFullYear(), c.last.getMonth(), 1);
+    let start = new Date(c.first.getFullYear(), c.first.getMonth(), 1);
+    const earliest = new Date(end.getFullYear(), end.getMonth() - 23, 1);
+    if (start < earliest) start = earliest;
+    const entries = [];
+    for (let d = start; d <= end; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) {
+      const v = c.byMonth.get(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`) || { distance: 0, count: 0 };
+      entries.push({
+        value: v.distance, text: `${fmtDist(v.distance)} · ${tn("stat.nActivities", v.count)}`,
+        short: pixelSafe(d.toLocaleDateString(loc(), { month: "narrow" })),
+        long: pixelSafe(d.toLocaleDateString(loc(), { month: "long", year: "numeric" })),
+      });
+    }
+    return bars(entries, (e) => e.long, t("comb.byMonth"));
+  }
+
+  function weekdayBars(c) {
+    const entries = c.byWeekday.map((v, i) => {
+      const d = new Date(2024, 0, 1 + i); // 2024-01-01 was a Monday
+      return {
+        value: v.distance, text: `${fmtDist(v.distance)} · ${tn("stat.nActivities", v.count)}`,
+        short: pixelSafe(d.toLocaleDateString(loc(), { weekday: "short" })),
+        long: pixelSafe(d.toLocaleDateString(loc(), { weekday: "long" })),
+      };
+    });
+    return bars(entries, (e) => e.long, t("comb.byWeekday"));
+  }
+
+  const SORTERS = {
+    date: (a) => a.start_time || 0,
+    name: (a) => a.name.toLocaleLowerCase(loc()),
+    sport: (a) => sportLabel(a.sport),
+    distance: (a) => a.stats.distance_m || 0,
+    time: (a) => a.stats.moving_s || 0,
+    speed: (a) => a.stats.avg_speed || 0,
+    elev: (a) => a.stats.ascent_m || 0,
+    hr: (a) => a.stats.avg_hr || 0,
+  };
+
+  function sortedFiltered() {
+    const key = SORTERS[state.sort.key] ? state.sort.key : "date";
+    const get = SORTERS[key];
+    const dir = state.sort.dir;
+    return [...state.filtered].sort((x, y) => {
+      const a = get(x), b = get(y);
+      if (a < b) return -dir;
+      if (a > b) return dir;
+      return 0;
+    });
+  }
+
+  function activityTable() {
+    const cols = [
+      ["date", "col.date"], ["name", "col.name"], ["sport", "col.sport"], ["distance", "col.distance"],
+      ["time", "col.time"], ["speed", "col.speed"], ["elev", "col.elev"], ["hr", "col.hr"],
+    ];
+    const head = h("tr", null, cols.map(([key, label]) => {
+      const active = state.sort.key === key;
+      return h("th", { class: key === "name" || key === "sport" || key === "date" ? "" : "num", "aria-sort": active ? (state.sort.dir > 0 ? "ascending" : "descending") : null },
+        h("button", {
+          type: "button", class: `sort${active ? " active" : ""}`,
+          onclick: () => {
+            state.sort = { key, dir: active ? -state.sort.dir : (key === "name" || key === "sport" ? 1 : -1) };
+            renderCombined();
+          },
+        }, t(label), active ? (state.sort.dir > 0 ? " ▲" : " ▼") : ""));
+    }));
+    const rows = sortedFiltered().slice(0, state.tableLimit).map((a) => h("tr", {
+      class: a.id === state.selectedId ? "selected" : "", tabindex: "0",
+      onclick: () => selectActivity(a.id),
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectActivity(a.id); } },
+    },
+      h("td", { class: "nowrap" }, fmtDate(startDate(a), SHORT_DATE)),
+      h("td", { class: "name-cell" }, a.name),
+      h("td", null, h("span", { class: "swatch", style: `background:${sportColor(a.sport)}` }), sportLabel(a.sport)),
+      h("td", { class: "num" }, fmtDist(a.stats.distance_m)),
+      h("td", { class: "num" }, fmtDuration(a.stats.moving_s)),
+      h("td", { class: "num" }, fmtSpeed(a.stats.avg_speed, a.sport)),
+      h("td", { class: "num" }, a.stats.ascent_m ? fmtEle(a.stats.ascent_m) : "—"),
+      h("td", { class: "num" }, a.stats.avg_hr ? num(a.stats.avg_hr) : "—")));
+    const wrap = h("div", { class: "table-wrap" }, h("table", { class: "table activities" }, h("thead", null, head), h("tbody", null, rows)));
+    if (state.filtered.length > state.tableLimit) {
+      return h("div", null, wrap, h("button", {
+        type: "button", class: "btn ghost small",
+        onclick: () => { state.tableLimit += 500; renderCombined(); },
+      }, t("list.more", { n: state.filtered.length - state.tableLimit })));
+    }
+    return wrap;
+  }
+
+  // ---------- single activity ----------
+
+  async function selectActivity(id) {
+    state.selectedId = id && state.byId.has(id) ? id : null;
+    renderTitle();
+    renderList();
+    renderSelected();
+    if (!state.selectedId) {
+      MapView.render(state.filtered, null, true);
+      return;
+    }
+    MapView.render(state.filtered, state.selectedId, false);
+    $("#content").scrollTop = 0;
+    $("#stats-panel").scrollTop = 0;
+    try {
+      const detail = await loadDetail(id);
+      if (state.selectedId !== id) return;
+      renderSelected();
+      MapView.showDetail(detail);
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  async function loadDetail(id) {
+    if (state.details.has(id)) return state.details.get(id);
+    const d = await api("GET", `/activities/${encodeURIComponent(id)}`);
+    d.track = Array.isArray(d.track) ? d.track : [];
+    d.detail = d.detail || { splits_km: [], splits_mi: [], profile: [] };
+    state.details.set(id, d);
+    return d;
+  }
+
+  function renderSelected() {
+    const box = $("#selected");
+    const a = state.selectedId && state.byId.get(state.selectedId);
+    if (!a) { box.hidden = true; setChildren(box, ); return; }
+    const s = a.stats;
+    const d = state.details.get(a.id);
+    const pace = usesPace(a.sport);
+    const items = [
+      card(t("stat.distance"), fmtDist(s.distance_m)),
+      card(t("stat.movingTime"), fmtDuration(s.moving_s), t("stat.elapsedV", { v: fmtDuration(s.elapsed_s) })),
+      card(t(pace ? "stat.avgPace" : "stat.avgSpeed"), fmtSpeed(s.avg_speed, a.sport)),
+      s.max_speed ? card(t("stat.maxSpeed"), fmtSpeed(s.max_speed, pace ? "Ride" : a.sport)) : null,
+      s.has_ele || s.ascent_m ? card(t("stat.ascent"), fmtEle(s.ascent_m), t("stat.descentV", { v: fmtEle(s.descent_m) })) : null,
+      s.has_ele ? card(t("stat.elevation"), `${fmtEle(s.min_ele)} – ${fmtEle(s.max_ele)}`) : null,
+      s.avg_hr ? card(t("stat.avgHR"), `${num(s.avg_hr)} ${t("unit.bpm")}`, t("stat.maxV", { v: `${num(s.max_hr)} ${t("unit.bpm")}` })) : null,
+      s.avg_cadence ? card(t("stat.cadence"), num(s.avg_cadence), t("stat.maxV", { v: num(s.max_cadence) })) : null,
+      s.avg_power ? card(t("stat.power"), `${num(s.avg_power)} W`, t("stat.maxV", { v: `${num(s.max_power)} W` })) : null,
+      s.has_temp ? card(t("stat.temp"), `${num(s.avg_temp, 1)} °C`) : null,
+      s.calories ? card(t("stat.calories"), num(s.calories)) : null,
+      card(t("stat.points"), num(s.points), t(`fmt.${a.format}`)),
+    ];
+    const where = [];
+    if (s.start) where.push(h("span", null, h("span", { class: "dot start", "aria-hidden": "true" }), t("det.start"), ` ${s.start.lat.toFixed(5)}, ${s.start.lon.toFixed(5)}`));
+    if (s.end) where.push(h("span", null, h("span", { class: "dot end", "aria-hidden": "true" }), t("det.finish"), ` ${s.end.lat.toFixed(5)}, ${s.end.lon.toFixed(5)}`));
+    if (s.start && s.end) {
+      const gap = haversine(s.start.lat, s.start.lon, s.end.lat, s.end.lon);
+      where.push(h("span", { class: "muted" }, gap < 200 ? t("det.loop") : t("det.gap", { v: fmtDist(gap) })));
+    }
+
+    const splits = d ? (imperial() ? d.detail.splits_mi : d.detail.splits_km) || [] : [];
+    const splitTable = splits.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" },
+      h("thead", null, h("tr", null, h("th", null, t(imperial() ? "col.mile" : "col.km")), h("th", { class: "num" }, t("col.time")),
+        h("th", { class: "num" }, t("col.speed")), h("th", { class: "num" }, t("col.elev")), h("th", { class: "num" }, t("col.hr")))),
+      h("tbody", null, splits.map((sp) => h("tr", null,
+        h("td", null, sp.distance_m < (imperial() ? 1609 : 999) ? `${sp.index} (${fmtDist(sp.distance_m)})` : String(sp.index)),
+        h("td", { class: "num" }, fmtDuration(sp.time_s)),
+        h("td", { class: "num" }, sp.time_s ? fmtSpeed(sp.distance_m / sp.time_s, a.sport) : "—"),
+        h("td", { class: "num" }, `${sp.ele_diff > 0 ? "+" : sp.ele_diff < 0 ? "−" : ""}${fmtEle(Math.abs(sp.ele_diff || 0))}`),
+        h("td", { class: "num" }, sp.avg_hr ? num(sp.avg_hr) : "—")))))) : null;
+
+    const profile = d && d.detail.profile && d.detail.profile.length > 1
+      ? h("canvas", { id: "profile", class: "profile", height: "140", role: "img", "aria-label": t("det.profile") }) : null;
+
+    box.hidden = false;
+    setChildren(box, 
+      h("div", { class: "panel-head" },
+        h("h2", null, h("span", { class: "swatch", style: `background:${sportColor(a.sport)}` }), a.name),
+        h("span", { class: "spacer" }),
+        h("button", { type: "button", class: "btn ghost small", onclick: () => openEdit(a) }, t("det.edit")),
+        h("button", { type: "button", class: "icon-btn", "aria-label": t("common.close"), title: t("common.close"), onclick: () => selectActivity(null) }, "×")),
+      h("p", { class: "muted small meta" },
+        `${fmtDateTime(startDate(a))} · ${sportLabel(a.sport)}${a.file_name ? ` · ${a.file_name}` : ""}`),
+      where.length ? h("p", { class: "small where" }, where) : null,
+      a.has_track ? null : h("p", { class: "muted small" }, t("det.noGps")),
+      h("div", { class: "cards" }, items),
+      profile ? h("h3", null, t("det.profile")) : null, profile,
+      splitTable ? h("h3", null, t(imperial() ? "det.splitsMi" : "det.splitsKm")) : null, splitTable,
+      d ? null : h("p", { class: "muted small" }, t("common.loading")));
+    if (profile) requestAnimationFrame(() => drawProfile(profile, d.detail.profile));
+  }
+
+  function haversine(lat1, lon1, lat2, lon2) {
+    const r = Math.PI / 180;
+    const a = Math.sin((lat2 - lat1) * r / 2) ** 2 + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin((lon2 - lon1) * r / 2) ** 2;
+    return 2 * 6371008.8 * Math.asin(Math.min(1, Math.sqrt(a)));
+  }
+
+  // Elevation profile in the pixel look: stepped area chart in theme colours.
+  function drawProfile(canvas, pts) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 300, hgt = canvas.clientHeight || 140;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(hgt * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, w, hgt);
+    const mg = { l: 44, r: 6, t: 8, b: 18 };
+    const maxD = pts[pts.length - 1][0] || 1;
+    let minE = Infinity, maxE = -Infinity;
+    for (const [, e] of pts) { minE = Math.min(minE, e); maxE = Math.max(maxE, e); }
+    if (maxE - minE < 10) { maxE += 5; minE -= 5; }
+    const x = (dd) => mg.l + (dd / maxD) * (w - mg.l - mg.r);
+    const y = (e) => mg.t + (1 - (e - minE) / (maxE - minE)) * (hgt - mg.t - mg.b);
+    ctx.fillStyle = cssVar("--panel-2");
+    ctx.fillRect(mg.l, mg.t, w - mg.l - mg.r, hgt - mg.t - mg.b);
+    ctx.beginPath();
+    ctx.moveTo(Math.round(x(pts[0][0])), hgt - mg.b);
+    for (const [dd, e] of pts) ctx.lineTo(Math.round(x(dd)), Math.round(y(e)));
+    ctx.lineTo(Math.round(x(maxD)), hgt - mg.b);
+    ctx.closePath();
+    ctx.fillStyle = cssVar("--today");
+    ctx.fill();
+    ctx.beginPath();
+    pts.forEach(([dd, e], i) => (i ? ctx.lineTo : ctx.moveTo).call(ctx, Math.round(x(dd)) + 0.5, Math.round(y(e)) + 0.5));
+    ctx.strokeStyle = cssVar("--accent");
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = cssVar("--muted");
+    ctx.font = "8px 'Stravall Pixel', monospace";
+    ctx.textBaseline = "middle";
+    ctx.fillText(fmtEle(maxE), 2, mg.t + 4);
+    ctx.fillText(fmtEle(minE), 2, hgt - mg.b - 4);
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("0", mg.l, hgt - 4);
+    const end = fmtDist(maxD);
+    ctx.fillText(end, w - mg.r - ctx.measureText(end).width, hgt - 4);
+  }
+
+  // ---------- edit / delete one activity ----------
+
+  function openEdit(a) {
+    const f = $("#edit-form");
+    f.reset();
+    showError($("#edit-error"), "");
+    f.name.value = a.name;
+    f.sport.value = a.sport || "";
+    const sports = [...new Set(state.activities.map((x) => x.sport).filter(Boolean)).add("Run").add("Ride").add("Walk").add("Hike").add("Swim")].sort();
+    $("#sports").replaceChildren(...sports.map((s) => h("option", { value: s })));
+    f.dataset.id = a.id;
+    $("#edit-dialog").showModal();
+    f.name.focus();
+  }
+
+  async function onEditSubmit(ev) {
+    ev.preventDefault();
+    const f = ev.target;
+    const id = f.dataset.id;
+    if (!f.name.value.trim()) return showError($("#edit-error"), t("edit.errName"));
+    try {
+      const res = await api("PATCH", `/activities/${encodeURIComponent(id)}`, { name: f.name.value, sport: f.sport.value });
+      const a = state.byId.get(id);
+      if (a) { a.name = res.name; a.sport = res.sport; }
+      const d = state.details.get(id);
+      if (d) { d.name = res.name; d.sport = res.sport; }
+      $("#edit-dialog").close();
+      toast(t("toast.saved"));
+      fillSportFilter();
+      applyFilter(false);
+    } catch (e) {
+      showError($("#edit-error"), e.message);
+    }
+  }
+
+  async function onEditDelete() {
+    const id = $("#edit-form").dataset.id;
+    const a = state.byId.get(id);
+    if (!a || !confirm(t("edit.confirmDelete", { name: a.name }))) return;
+    try {
+      await api("DELETE", `/activities/${encodeURIComponent(id)}`);
+      $("#edit-dialog").close();
+      state.selectedId = null;
+      toast(t("toast.deleted"));
+      await loadActivities();
+    } catch (e) {
+      showError($("#edit-error"), e.message);
+    }
+  }
+
+  async function deleteAll() {
+    if (!state.activities.length) return;
+    if (!confirm(t("upload.confirmDeleteAll", { n: state.activities.length }))) return;
+    try {
+      await api("POST", "/activities/delete", { all: true });
+      state.selectedId = null;
+      toast(t("toast.deletedAll"));
+      await loadActivities();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  async function deleteFiltered() {
+    const ids = state.filtered.map((a) => a.id);
+    if (!ids.length || !confirm(t("upload.confirmDeleteFiltered", { n: ids.length }))) return;
+    try {
+      for (let i = 0; i < ids.length; i += 5000) await api("POST", "/activities/delete", { ids: ids.slice(i, i + 5000) });
+      state.selectedId = null;
+      toast(t("toast.deletedN", { n: ids.length }));
+      await loadActivities();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  // ---------- upload ----------
+
+  const ACCEPT = /\.(gpx|tcx|fit|csv|xml|zip|gz)$/i;
+
+  function openUpload() {
+    $("#upload-results").replaceChildren();
+    $("#upload-progress").hidden = true;
+    $("#upload-limit").textContent = t("upload.limit", { mb: state.config.max_upload_mb });
+    $("#delete-all").hidden = !state.activities.length;
+    $("#delete-filtered").hidden = !state.activities.length || state.filtered.length === state.activities.length || !state.filtered.length;
+    $("#upload-dialog").showModal();
+  }
+
+  function chooseFiles() {
+    const input = $("#upload-file");
+    input.value = "";
+    input.click();
+  }
+
+  // Uploads one file as the raw request body, reporting progress (0..1).
+  function uploadOne(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/api/activities/upload?filename=${encodeURIComponent(file.name)}`);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("X-Requested-With", "stravall");
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.responseType = "json";
+      xhr.upload.addEventListener("progress", (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); });
+      xhr.addEventListener("load", () => {
+        const data = xhr.response;
+        if (xhr.status === 401) { state.user = null; showAuth(); reject(new Error(t("auth.signInAgain"))); return; }
+        if (xhr.status >= 200 && xhr.status < 300 && data) resolve(data);
+        else reject(new Error((data && data.error && I18N.serverError(data.error)) || t("common.requestFailed", { status: xhr.status })));
+      });
+      xhr.addEventListener("error", () => reject(new Error(t("upload.networkError"))));
+      xhr.send(file);
+    });
+  }
+
+  async function uploadFiles(fileList) {
+    // activities.csv first: the activity files uploaded after it then add
+    // their routes to the rows (keeping Strava's names and types).
+    const isCsv = (f) => (/\.csv(\.gz)?$/i.test(f.name) ? 1 : 0);
+    const files = [...fileList].sort((x, y) => isCsv(y) - isCsv(x));
+    if (!files.length || state.uploading) return;
+    if (!$("#upload-dialog").open) openUpload();
+    const results = $("#upload-results");
+    results.replaceChildren();
+    const bar = $("#upload-bar");
+    const label = $("#upload-label");
+    $("#upload-progress").hidden = false;
+    state.uploading = true;
+    $("#upload-choose").disabled = true;
+    const total = { imported: 0, updated: 0, duplicates: 0, failed: 0 };
+    const maxBytes = state.config.max_upload_mb * 1024 * 1024;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const li = h("li", null, h("span", { class: "file" }, file.name), h("span", { class: "muted small status" }, t("upload.waiting")));
+      results.append(li);
+      li.scrollIntoView({ block: "nearest" });
+      const status = li.querySelector(".status");
+      const setStatus = (text, cls) => { status.textContent = text; status.className = `small status ${cls || ""}`; };
+      if (!ACCEPT.test(file.name)) { total.failed++; setStatus(t("upload.unsupported"), "err"); continue; }
+      if (file.size > maxBytes) { total.failed++; setStatus(t("upload.tooLarge", { mb: state.config.max_upload_mb }), "err"); continue; }
+      label.textContent = t("upload.progress", { i: i + 1, n: files.length, name: file.name });
+      try {
+        const res = await uploadOne(file, (p) => {
+          bar.value = (i + p * 0.9) / files.length;
+          setStatus(p < 1 ? `${Math.round(p * 100)}%` : t("upload.processing"));
+        });
+        total.imported += res.imported; total.updated += res.updated; total.duplicates += res.duplicates; total.failed += res.failed;
+        const parts = [];
+        if (res.imported) parts.push(tn("upload.nImported", res.imported));
+        if (res.updated) parts.push(tn("upload.nUpdated", res.updated));
+        if (res.duplicates) parts.push(tn("upload.nDuplicates", res.duplicates));
+        if (res.failed) parts.push(tn("upload.nFailed", res.failed));
+        setStatus(parts.join(" · ") || t("upload.nothing"), res.failed ? "err" : res.imported || res.updated ? "ok" : "");
+        const errors = (res.results || []).filter((r) => r.status === "error").slice(0, 20);
+        if (errors.length) {
+          li.append(h("ul", { class: "upload-errors" }, errors.map((r) => h("li", { class: "small" }, `${r.file}: ${I18N.serverError(r.error)}`))));
+        }
+      } catch (e) {
+        total.failed++;
+        setStatus(e.message, "err");
+        if (!state.user) break;
+      }
+      bar.value = (i + 1) / files.length;
+    }
+    bar.value = 1;
+    label.textContent = t("upload.done", {
+      imported: total.imported, updated: total.updated, duplicates: total.duplicates, failed: total.failed,
+    });
+    state.uploading = false;
+    $("#upload-choose").disabled = false;
+    if (state.user && (total.imported || total.updated)) {
+      toast(tn("upload.nImported", total.imported + total.updated));
+      try { await loadActivities(); } catch (e) { toast(e.message); }
+      $("#delete-all").hidden = !state.activities.length;
+    }
+  }
+
+  // Drag and drop files anywhere onto the app.
+  function wireDrop() {
+    let depth = 0;
+    const isFiles = (e) => !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+    document.addEventListener("dragenter", (e) => {
+      if (!isFiles(e) || $("#app-view").hidden) return;
+      depth++;
+      document.body.classList.add("dropping");
+    });
+    document.addEventListener("dragleave", (e) => {
+      if (!isFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (!depth) document.body.classList.remove("dropping");
+    });
+    document.addEventListener("dragover", (e) => { if (isFiles(e) && !$("#app-view").hidden) e.preventDefault(); });
+    document.addEventListener("drop", (e) => {
+      if (!isFiles(e) || $("#app-view").hidden) return;
+      e.preventDefault();
+      depth = 0;
+      document.body.classList.remove("dropping");
+      uploadFiles(e.dataTransfer.files);
+    });
+  }
+
+  // ---------- map: Google Maps, or the offline pixel map ----------
+
+  const START_COLOR = "#39ff8f";
+  const END_COLOR = "#ff3d6e";
+
+  const MapView = {
+    mode: null, // "google" | "pixel"
+    list: [],
+    selectedId: null,
+    detail: null,
+    initStarted: false,
+
+    init() {
+      if (this.initStarted) return;
+      this.initStarted = true;
+      const key = state.config.maps_key;
+      if (!key) { this.usePixel(t("map.noKey")); return; }
+      this.usePixel(t("map.loading"));
+      loadGoogleMaps(key).then(() => {
+        GoogleMap.create($("#map"));
+        this.mode = "google";
+        $("#pixel-map").hidden = true;
+        $("#map").hidden = false;
+        $("#map-note").hidden = true;
+        this.redraw(true);
+      }).catch(() => { this.usePixel(t("map.failed")); });
+    },
+
+    usePixel(note) {
+      this.mode = "pixel";
+      $("#map").hidden = true;
+      $("#pixel-map").hidden = false;
+      $("#map-note").textContent = note;
+      $("#map-note").hidden = !note;
+      PixelMap.attach($("#pixel-map"));
+      this.redraw(true);
+    },
+
+    render(list, selectedId, fit) {
+      this.list = list;
+      if (this.selectedId !== selectedId) this.detail = null;
+      this.selectedId = selectedId;
+      if (selectedId && state.details.has(selectedId)) this.detail = state.details.get(selectedId);
+      this.redraw(fit || !!(selectedId && this.detail));
+      renderLegend(list);
+    },
+
+    showDetail(detail) {
+      if (detail.id !== this.selectedId) return;
+      this.detail = detail;
+      this.redraw(true);
+    },
+
+    redraw(fit) {
+      if (this.mode === "google") GoogleMap.draw(this.list, this.selectedId, this.detail, fit);
+      else if (this.mode === "pixel") PixelMap.draw(this.list, this.selectedId, this.detail, fit);
+    },
+
+    restyle() {
+      if (this.mode === "google") GoogleMap.restyle();
+      else this.redraw(false);
+    },
+  };
+
+  function renderLegend(list) {
+    const counts = new Map();
+    for (const a of list) if (a.has_track) counts.set(a.sport || "", (counts.get(a.sport || "") || 0) + 1);
+    const items = [...counts.entries()].sort((x, y) => y[1] - x[1]).slice(0, 8).map(([sp]) =>
+      h("span", { class: "legend-item" }, h("span", { class: "swatch", style: `background:${sportColor(sp)}` }), sportLabel(sp)));
+    if (state.markers && list.some((a) => a.has_track)) {
+      items.push(h("span", { class: "legend-item" }, h("span", { class: "dot start" }), t("det.start")));
+      items.push(h("span", { class: "legend-item" }, h("span", { class: "dot end" }), t("det.finish")));
+    }
+    $("#map-legend").replaceChildren(...items);
+    $("#map-legend").hidden = !items.length;
+  }
+
+  function routeBounds(list, detail) {
+    if (detail && detail.stats && detail.stats.bounds) return detail.stats.bounds;
+    let b = null;
+    for (const a of list) {
+      const s = a.stats && a.stats.bounds;
+      if (!s) continue;
+      if (!b) b = { ...s };
+      else {
+        b.min_lat = Math.min(b.min_lat, s.min_lat); b.max_lat = Math.max(b.max_lat, s.max_lat);
+        b.min_lon = Math.min(b.min_lon, s.min_lon); b.max_lon = Math.max(b.max_lon, s.max_lon);
+      }
+    }
+    return b;
+  }
+
+  let mapsPromise = null;
+  function loadGoogleMaps(key) {
+    if (window.google && window.google.maps && window.google.maps.Map) return Promise.resolve();
+    if (mapsPromise) return mapsPromise;
+    mapsPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timeout")), 20000);
+      window.__stravallMapsReady = () => { clearTimeout(timer); resolve(); };
+      // Called by the Maps API when the key is invalid or not allowed here.
+      window.gm_authFailure = () => { MapView.usePixel(t("map.authFailed")); };
+      const s = document.createElement("script");
+      const lang = I18N.lang();
+      s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&loading=async&language=${lang}&callback=__stravallMapsReady`;
+      s.async = true;
+      s.addEventListener("error", () => { clearTimeout(timer); reject(new Error("load failed")); });
+      document.head.append(s);
+    });
+    return mapsPromise;
+  }
+
+  // Dark map styles built from the active theme's colours.
+  function themedMapStyles() {
+    if (!darkTheme()) return [{ featureType: "poi.business", stylers: [{ visibility: "off" }] }];
+    return [
+      { elementType: "geometry", stylers: [{ color: cssVar("--panel") }] },
+      { elementType: "labels.text.fill", stylers: [{ color: cssVar("--muted") }] },
+      { elementType: "labels.text.stroke", stylers: [{ color: cssVar("--bg") }] },
+      { featureType: "landscape.natural", elementType: "geometry", stylers: [{ color: cssVar("--panel") }] },
+      { featureType: "poi", elementType: "geometry", stylers: [{ color: cssVar("--panel-2") }] },
+      { featureType: "poi.business", stylers: [{ visibility: "off" }] },
+      { featureType: "road", elementType: "geometry", stylers: [{ color: cssVar("--line") }] },
+      { featureType: "road", elementType: "labels.icon", stylers: [{ visibility: "off" }] },
+      { featureType: "transit", stylers: [{ visibility: "off" }] },
+      { featureType: "water", elementType: "geometry", stylers: [{ color: cssVar("--bg") }] },
+      { featureType: "administrative", elementType: "geometry.stroke", stylers: [{ color: cssVar("--edge") }] },
+    ];
+  }
+
+  const GoogleMap = {
+    map: null,
+    lines: new Map(), // id -> google.maps.Polyline (coarse preview route)
+    selLine: null,
+    info: null,
+
+    create(el) {
+      const g = window.google.maps;
+      this.map = new g.Map(el, {
+        center: { lat: 48, lng: 11 }, zoom: 4, mapTypeId: "roadmap", styles: themedMapStyles(),
+        streetViewControl: false, fullscreenControl: true, mapTypeControl: true, clickableIcons: false,
+        mapTypeControlOptions: { mapTypeIds: ["roadmap", "terrain", "satellite", "hybrid"] },
+      });
+      this.info = new g.InfoWindow();
+    },
+
+    restyle() { if (this.map) this.map.setOptions({ styles: themedMapStyles() }); },
+
+    endIcons(color, scale) {
+      if (!state.markers) return [];
+      const g = window.google.maps;
+      const square = "M -1,-1 1,-1 1,1 -1,1 z";
+      const icon = (fill) => ({ path: square, fillColor: fill, fillOpacity: 1, strokeColor: "#05060c", strokeWeight: 1, scale });
+      return [{ icon: icon(START_COLOR), offset: "0%" }, { icon: { ...icon(END_COLOR), path: g.SymbolPath.CIRCLE, scale: scale + 1 }, offset: "100%" }];
+    },
+
+    draw(list, selectedId, detail, fit) {
+      if (!this.map) return;
+      const g = window.google.maps;
+      const visible = new Set();
+      for (const a of list) {
+        if (!a.preview || a.preview.length < 2) continue;
+        visible.add(a.id);
+        let line = this.lines.get(a.id);
+        if (!line) {
+          line = new g.Polyline({ path: a.preview.map(([lat, lng]) => ({ lat, lng })), geodesic: false, clickable: true });
+          line.addListener("click", (e) => this.openInfo(a.id, e.latLng));
+          this.lines.set(a.id, line);
+        }
+        const dim = selectedId && selectedId !== a.id;
+        line.setOptions({
+          strokeColor: sportColor(a.sport), strokeOpacity: dim ? 0.25 : 0.85, strokeWeight: dim ? 2 : 3,
+          icons: dim || selectedId === a.id ? [] : this.endIcons(sportColor(a.sport), 3), zIndex: 1,
+        });
+        if (line.getMap() !== this.map) line.setMap(this.map);
+      }
+      for (const [id, line] of this.lines) if (!visible.has(id)) line.setMap(null);
+
+      if (this.selLine) { this.selLine.setMap(null); this.selLine = null; }
+      const sel = selectedId && state.byId.get(selectedId);
+      const path = detail && detail.track && detail.track.length > 1 ? detail.track : sel && sel.preview;
+      if (sel && path && path.length > 1) {
+        this.selLine = new g.Polyline({
+          map: this.map, path: path.map(([lat, lng]) => ({ lat, lng })), strokeColor: cssVar("--accent") || "#00f0ff",
+          strokeOpacity: 1, strokeWeight: 5, zIndex: 10, icons: this.endIcons("", 5),
+        });
+        this.selLine.addListener("click", (e) => this.openInfo(sel.id, e.latLng));
+      }
+      if (fit) {
+        const b = routeBounds(sel ? [sel] : list, detail);
+        if (b) {
+          if (b.min_lat === b.max_lat && b.min_lon === b.max_lon) { this.map.setCenter({ lat: b.min_lat, lng: b.min_lon }); this.map.setZoom(15); }
+          else this.map.fitBounds({ south: b.min_lat, west: b.min_lon, north: b.max_lat, east: b.max_lon }, 32);
+        }
+      }
+    },
+
+    openInfo(id, latLng) {
+      const a = state.byId.get(id);
+      if (!a) return;
+      const s = a.stats;
+      const box = h("div", { class: "map-info" },
+        h("strong", null, a.name),
+        h("div", null, `${fmtDate(startDate(a), SHORT_DATE)} · ${sportLabel(a.sport)}`),
+        h("div", null, `${fmtDist(s.distance_m)} · ${fmtDuration(s.moving_s)} · ${fmtSpeed(s.avg_speed, a.sport)}`),
+        state.selectedId === id ? null : h("button", { type: "button", class: "btn small", onclick: () => { this.info.close(); selectActivity(id); } }, t("map.details")));
+      this.info.setContent(box);
+      this.info.setPosition(latLng);
+      this.info.open({ map: this.map });
+    },
+  };
+
+  // Offline map: routes on the theme's grid (Web Mercator), with wheel/pinch
+  // zoom, drag to pan and click to select a route.
+  const PixelMap = {
+    canvas: null,
+    view: null, // { cx, cy, scale } in mercator units (0..1) and px per unit
+    list: [],
+    selectedId: null,
+    detail: null,
+    wired: false,
+
+    attach(canvas) {
+      this.canvas = canvas;
+      if (this.wired) return;
+      this.wired = true;
+      const pointers = new Map();
+      let drag = null, moved = false, pinch = null;
+      canvas.addEventListener("pointerdown", (e) => {
+        canvas.setPointerCapture(e.pointerId);
+        pointers.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
+        moved = false;
+        if (pointers.size === 1) drag = { x: e.offsetX, y: e.offsetY };
+        if (pointers.size === 2) {
+          const [p1, p2] = [...pointers.values()];
+          pinch = { d: Math.hypot(p1.x - p2.x, p1.y - p2.y), scale: this.view && this.view.scale };
+        }
+      });
+      canvas.addEventListener("pointermove", (e) => {
+        if (!pointers.has(e.pointerId) || !this.view) return;
+        pointers.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
+        if (pointers.size === 2 && pinch) {
+          const [p1, p2] = [...pointers.values()];
+          const d = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+          if (pinch.d > 0) this.zoomAt((p1.x + p2.x) / 2, (p1.y + p2.y) / 2, (pinch.scale * d) / pinch.d / this.view.scale);
+          moved = true;
+          return;
+        }
+        if (!drag) return;
+        const dx = e.offsetX - drag.x, dy = e.offsetY - drag.y;
+        if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+        this.view.cx -= dx / this.view.scale;
+        this.view.cy -= dy / this.view.scale;
+        drag = { x: e.offsetX, y: e.offsetY };
+        this.paint();
+      });
+      const up = (e) => {
+        pointers.delete(e.pointerId);
+        if (pointers.size < 2) pinch = null;
+        if (pointers.size === 0) {
+          if (!moved && e.type === "pointerup") this.pick(e.offsetX, e.offsetY);
+          drag = null;
+        }
+      };
+      canvas.addEventListener("pointerup", up);
+      canvas.addEventListener("pointercancel", up);
+      canvas.addEventListener("wheel", (e) => {
+        if (!this.view) return;
+        e.preventDefault();
+        this.zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)));
+      }, { passive: false });
+      canvas.addEventListener("dblclick", (e) => { if (this.view) this.zoomAt(e.offsetX, e.offsetY, 2); });
+      if (window.ResizeObserver) new ResizeObserver(() => this.paint()).observe(canvas);
+      else window.addEventListener("resize", () => this.paint());
+    },
+
+    zoomAt(px, py, factor) {
+      const v = this.view;
+      const w = this.canvas.clientWidth, hh = this.canvas.clientHeight;
+      const mx = v.cx + (px - w / 2) / v.scale, my = v.cy + (py - hh / 2) / v.scale;
+      v.scale = Math.min(1e8, Math.max(50, v.scale * factor));
+      v.cx = mx - (px - w / 2) / v.scale;
+      v.cy = my - (py - hh / 2) / v.scale;
+      this.paint();
+    },
+
+    merc(lat, lon) {
+      const s = Math.sin(Math.max(-85, Math.min(85, lat)) * Math.PI / 180);
+      return [(lon + 180) / 360, 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)];
+    },
+
+    draw(list, selectedId, detail, fit) {
+      this.list = list;
+      this.selectedId = selectedId;
+      this.detail = detail;
+      if (fit || !this.view) this.fit();
+      this.paint();
+    },
+
+    fit() {
+      const sel = this.selectedId && state.byId.get(this.selectedId);
+      const b = routeBounds(sel ? [sel] : this.list, this.detail);
+      const w = this.canvas.clientWidth || 600, hh = this.canvas.clientHeight || 400;
+      if (!b) { this.view = { cx: 0.5, cy: 0.5, scale: Math.min(w, hh) }; return; }
+      const [x1, y1] = this.merc(b.max_lat, b.min_lon);
+      const [x2, y2] = this.merc(b.min_lat, b.max_lon);
+      const spanX = Math.max(x2 - x1, 1e-6), spanY = Math.max(y2 - y1, 1e-6);
+      const scale = Math.min((w - 48) / spanX, (hh - 48) / spanY, 4e6);
+      this.view = { cx: (x1 + x2) / 2, cy: (y1 + y2) / 2, scale: Math.max(50, scale) };
+    },
+
+    project(lat, lon) {
+      const [x, y] = this.merc(lat, lon);
+      const v = this.view;
+      return [(x - v.cx) * v.scale + this.canvas.clientWidth / 2, (y - v.cy) * v.scale + this.canvas.clientHeight / 2];
+    },
+
+    paint() {
+      const c = this.canvas;
+      if (!c || c.hidden || !this.view) return;
+      const dpr = window.devicePixelRatio || 1;
+      const w = c.clientWidth, hh = c.clientHeight;
+      if (!w || !hh) return;
+      if (c.width !== Math.round(w * dpr) || c.height !== Math.round(hh * dpr)) {
+        c.width = Math.round(w * dpr);
+        c.height = Math.round(hh * dpr);
+      }
+      const ctx = c.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = cssVar("--panel");
+      ctx.fillRect(0, 0, w, hh);
+      // Grid every ~64 px, aligned to the map so it moves while panning.
+      ctx.strokeStyle = cssVar("--bg-dot");
+      ctx.lineWidth = 2;
+      const v = this.view;
+      const stepUnits = Math.pow(2, Math.round(Math.log2(64 / v.scale)));
+      const left = v.cx - w / 2 / v.scale, top = v.cy - hh / 2 / v.scale;
+      ctx.beginPath();
+      for (let gx = Math.floor(left / stepUnits) * stepUnits; gx < left + w / v.scale; gx += stepUnits) {
+        const px = Math.round((gx - left) * v.scale) + 0.5;
+        ctx.moveTo(px, 0); ctx.lineTo(px, hh);
+      }
+      for (let gy = Math.floor(top / stepUnits) * stepUnits; gy < top + hh / v.scale; gy += stepUnits) {
+        const py = Math.round((gy - top) * v.scale) + 0.5;
+        ctx.moveTo(0, py); ctx.lineTo(w, py);
+      }
+      ctx.stroke();
+
+      const sel = this.selectedId;
+      const line = (pts, color, width, alpha) => {
+        if (!pts || pts.length < 2) return;
+        ctx.globalAlpha = alpha;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        pts.forEach(([lat, lon], i) => { const [x, y] = this.project(lat, lon); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      };
+      const ends = (pts, size) => {
+        if (!state.markers || !pts || pts.length < 2) return;
+        const [sx, sy] = this.project(pts[0][0], pts[0][1]);
+        const [ex, ey] = this.project(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+        ctx.fillStyle = cssVar("--edge");
+        ctx.fillRect(Math.round(sx - size / 2) - 1, Math.round(sy - size / 2) - 1, size + 2, size + 2);
+        ctx.fillRect(Math.round(ex - size / 2) - 1, Math.round(ey - size / 2) - 1, size + 2, size + 2);
+        ctx.fillStyle = START_COLOR;
+        ctx.fillRect(Math.round(sx - size / 2), Math.round(sy - size / 2), size, size);
+        ctx.fillStyle = END_COLOR;
+        ctx.fillRect(Math.round(ex - size / 2), Math.round(ey - size / 2), size, size);
+      };
+      for (const a of this.list) {
+        if (a.id === sel) continue;
+        line(a.preview, sportColor(a.sport), sel ? 1.5 : 2, sel ? 0.3 : 0.85);
+      }
+      if (!sel) for (const a of this.list) ends(a.preview, 4);
+      const selA = sel && state.byId.get(sel);
+      if (selA) {
+        const pts = this.detail && this.detail.track && this.detail.track.length > 1 ? this.detail.track : selA.preview;
+        line(pts, cssVar("--drop"), 7, 0.9);
+        line(pts, cssVar("--accent"), 3, 1);
+        ends(pts, 8);
+      }
+    },
+
+    // Selects the route closest to a click (within 10 px).
+    pick(px, py) {
+      let best = null, bestD = 10;
+      for (const a of this.list) {
+        const pts = a.preview;
+        if (!pts || pts.length < 2) continue;
+        let prev = this.project(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) {
+          const cur = this.project(pts[i][0], pts[i][1]);
+          const d = segDist(px, py, prev, cur);
+          if (d < bestD) { bestD = d; best = a; }
+          prev = cur;
+        }
+      }
+      if (best) selectActivity(best.id === state.selectedId ? null : best.id);
+    },
+  };
+
+  function segDist(px, py, [ax, ay], [bx, by]) {
+    const dx = bx - ax, dy = by - ay;
+    const len = dx * dx + dy * dy;
+    const k = len ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len)) : 0;
+    return Math.hypot(px - (ax + k * dx), py - (ay + k * dy));
+  }
+
+  // ---------- sidebar ----------
+
+  const narrowScreen = window.matchMedia ? window.matchMedia("(max-width: 820px)") : null;
+  function isNarrow() { return !!(narrowScreen && narrowScreen.matches); }
+
   function setSidebar(open) {
     $("#sidebar").classList.toggle("open", open);
     $("#menu-toggle").setAttribute("aria-expanded", String(open));
   }
 
-  // Desktop: the sidebar can be hidden to the left as well (e.g. when the
-  // browser only has half of the screen), giving the calendar the full width.
-  // The choice is remembered.
   function desktopSidebarHidden() { return $("#app-view").classList.contains("sidebar-hidden"); }
+
   function setDesktopSidebar(hidden) {
     $("#app-view").classList.toggle("sidebar-hidden", hidden);
     localStorageSet("sidebar", hidden ? "hidden" : "shown");
     syncMenuToggle();
+    // The map gets wider/narrower: let it redraw after the transition.
+    setTimeout(() => MapView.redraw(false), 300);
   }
+
   function syncMenuToggle() {
     const open = isNarrow() ? $("#sidebar").classList.contains("open") : !desktopSidebarHidden();
     $("#menu-toggle").setAttribute("aria-expanded", String(open));
   }
+
   function toggleSidebar() {
     if (isNarrow()) setSidebar(!$("#sidebar").classList.contains("open"));
     else setDesktopSidebar(!desktopSidebarHidden());
   }
-  // Hides the sidebar; returns true if it was open as an overlay (phones).
+
   function closeSidebar() {
     const open = $("#sidebar").classList.contains("open");
     if (open) setSidebar(false);
     return open && isNarrow();
   }
 
-  function canEdit() { return state.calendar && state.calendar.role !== "viewer"; }
+  // ---------- pickers: theme, language, units ----------
 
-  async function refresh() {
-    const has = !!state.calendar;
-    $("#empty-state").hidden = has;
-    $("#calendar").hidden = !has;
-    for (const id of ["#share-calendar", "#edit-calendar", "#add-event", "#prev-month", "#next-month", "#today"]) {
-      $(id).hidden = !has;
-    }
-    if (!has) {
-      $("#month-title").textContent = "";
-      $("#summary").replaceChildren();
-      return;
-    }
-    $("#add-event").hidden = !canEdit();
-    $("#edit-calendar").hidden = !canEdit();
-    renderMonthTitle();
-
-    const gridStart = addDays(state.month, -((state.month.getDay() + 6) % 7));
-    const gridEnd = addDays(gridStart, 41);
-    const calId = state.calendar.id;
-    const [ledger, events] = await Promise.all([
-      api("GET", `/calendars/${calId}/ledger?from=${iso(gridStart)}&to=${iso(gridEnd)}`),
-      api("GET", `/calendars/${calId}/events`),
-    ]);
-    if (!state.calendar || state.calendar.id !== calId) return; // switched meanwhile
-    state.ledger = ledger;
-    state.calendar = { ...state.calendar, ...ledger.calendar };
-    state.events = new Map(events.map((e) => [e.id, e]));
-    renderGrid();
-    renderSummary();
-    renderCategories();
-    if (state.dayOpen) openDay(state.dayOpen, true);
-  }
-
-  // Month heading; phones get the short month name so the toolbar stays on one line.
-  function renderMonthTitle() {
-    const el = $("#month-title");
-    if (!el) return;
-    if (!state.calendar) { el.textContent = ""; return; }
-    el.textContent = I18N.capitalize(fmtDate(state.month, { month: isNarrow() ? "short" : "long", year: "numeric" }));
-  }
-
-  function renderGrid() {
-    $("#weekdays").replaceChildren(...weekdayNames().map((d) => h("div", null, d)));
-    const todayIso = iso(new Date());
-    const month = state.month.getMonth();
-    const cells = state.ledger.days.map((day) => {
-      const date = parseISO(day.date);
-      const classes = ["day"];
-      if (date.getMonth() !== month) classes.push("other");
-      if (day.date === todayIso) classes.push("today");
-      if (day.balance < 0) classes.push("negative");
-      if (day.entries.length) classes.push("has-items");
-      if (day.override !== undefined && day.override !== null) classes.push("override");
-      const label = t("day.aria", {
-        date: fmtDate(date, { weekday: "long", day: "numeric", month: "long" }),
-        count: tn("day.tx", day.entries.length),
-        amount: money(day.balance),
-      }) + (classes.includes("override") ? t("day.ariaManual") : "");
-      return h("button", {
-        type: "button", class: classes.join(" "), "aria-label": label, "aria-haspopup": "menu",
-        onclick: () => { if (closeSidebar()) return; openDay(day.date); },
-        oncontextmenu: (e) => openDayMenu(e, day.date),
-      },
-        h("span", { class: "num" }, date.getDate()),
-        h("span", { class: "items" },
-          day.entries.map((e) => h("span", { class: `item ${e.amount >= 0 ? "inc" : "exp"}`, title: `${e.title} ${money(e.amount)}` },
-            h("span", { class: "t" }, isNarrow() ? shortTitle(e.title) : e.title), " ",
-            h("span", { class: "a" }, isNarrow() ? cellMoney(e.amount) : money(e.amount, { maximumFractionDigits: 0, minimumFractionDigits: 0 }))))),
-        // "+x more" sits outside the clipped item list so it is always visible;
-        // fitDayItems() decides how many transactions fit and fills in x.
-        day.entries.length ? h("span", { class: "more", hidden: true }) : null,
-        h("span", { class: "bal", title: classes.includes("override") ? t("day.balanceManualTitle") : null }, cellMoney(day.balance)));
-    });
-    const grid = $("#grid");
-    grid.replaceChildren(...cells);
-    fitAllDays();
-    const slide = state.slide;
-    const swipeIn = state.swipeIn;
-    state.slide = 0;
-    state.swipeIn = 0;
-    if (swipeIn) { slideGridIn(grid, swipeIn); return; }
-    resetGridPosition(grid);
-    animate(grid, slide > 0 ? "slide-next" : slide < 0 ? "slide-prev" : "fade");
-  }
-
-  // ---------- "+x more": as many transactions as fit the day box ----------
-  // Shows every transaction of a day that fits completely in its cell and
-  // replaces the rest with "+x more". Runs after each render and whenever the
-  // cells change size (window resize, sidebar toggle, font loaded, ...), on
-  // desktop and on phones alike.
-  function fitDayItems(cell) {
-    const items = cell.querySelector(".items");
-    const more = cell.querySelector(".more");
-    if (!items || !more) return;
-    const list = Array.from(items.children);
-    list.forEach((el) => el.classList.remove("extra"));
-    more.hidden = true;
-    if (!list.length || items.scrollHeight <= items.clientHeight + 1) return;
-    // Not everything fits: reserve the line for "+x more", then keep the
-    // transactions that are still completely visible.
-    more.textContent = t("day.more", { n: list.length });
-    more.hidden = false;
-    const limit = items.getBoundingClientRect().top + items.clientHeight + 0.5;
-    let shown = 0;
-    while (shown < list.length && list[shown].getBoundingClientRect().bottom <= limit) shown++;
-    list.slice(shown).forEach((el) => el.classList.add("extra"));
-    more.textContent = t("day.more", { n: list.length - shown });
-  }
-
-  function fitAllDays() {
-    const grid = $("#grid");
-    if (!grid || !grid.clientHeight) return; // hidden: refitted once it is shown
-    grid.querySelectorAll(".day").forEach(fitDayItems);
-  }
-
-  let fitFrame = 0;
-  function scheduleFit() {
-    if (fitFrame) return;
-    fitFrame = requestAnimationFrame(() => { fitFrame = 0; fitAllDays(); });
-  }
-
-  function watchDaySizes() {
-    const grid = $("#grid");
-    if (window.ResizeObserver) {
-      // The grid's own size changes with the window, the sidebar and the
-      // number of week rows; that is when the day boxes change size too.
-      let last = "";
-      new ResizeObserver(() => {
-        const key = `${grid.clientWidth}x${grid.clientHeight}`;
-        if (key !== last) { last = key; scheduleFit(); }
-      }).observe(grid);
-    }
-    window.addEventListener("resize", scheduleFit);
-    window.addEventListener("orientationchange", scheduleFit);
-    // The pixel font loads asynchronously and changes the line heights.
-    if (document.fonts) {
-      if (document.fonts.ready) document.fonts.ready.then(scheduleFit).catch(() => {});
-      if (document.fonts.addEventListener) document.fonts.addEventListener("loadingdone", scheduleFit);
-    }
-  }
-
-  // ---------- horizontal month scrolling (swipe) ----------
-  // The grid follows the finger; on release the old month scrolls out and the
-  // new one scrolls in from the other side.
-  const SWIPE_EASE = "cubic-bezier(.25, .8, .25, 1)";
-
-  function gridWidth() {
-    const cal = $("#calendar");
-    return (cal && cal.clientWidth) || window.innerWidth || 360;
-  }
-
-  function moveGrid(grid, x, ms) {
-    const w = gridWidth();
-    grid.style.transition = ms ? `transform ${ms}ms ${SWIPE_EASE}, opacity ${ms}ms ${SWIPE_EASE}` : "none";
-    grid.style.transform = `translate3d(${Math.round(x)}px, 0, 0)`;
-    grid.style.opacity = String(Math.max(0.3, 1 - (Math.abs(x) / w) * 0.7));
-  }
-
-  function resetGridPosition(grid) {
-    grid.style.transition = "";
-    grid.style.transform = "";
-    grid.style.opacity = "";
-  }
-
-  let swipeTimer = null;
-  function slideGridIn(grid, dir) {
-    clearTimeout(swipeTimer);
-    grid.classList.remove("slide-next", "slide-prev", "fade");
-    if (reducedMotion()) { resetGridPosition(grid); state.swiping = false; return; }
-    moveGrid(grid, dir * gridWidth(), 0);
-    void grid.offsetWidth; // start from the far side
-    moveGrid(grid, 0, 280);
-    swipeTimer = setTimeout(() => { resetGridPosition(grid); state.swiping = false; }, 300);
-  }
-
-  // Scrolls the current month out (dir 1 = to the left, next month) and loads the new one.
-  function commitSwipe(dir) {
-    const grid = $("#grid");
-    state.swiping = true;
-    clearTimeout(swipeTimer);
-    const ms = reducedMotion() ? 0 : 180;
-    moveGrid(grid, -dir * gridWidth(), ms);
-    swipeTimer = setTimeout(() => changeMonth(dir, true), ms);
-  }
-
-  // Not far enough: the month scrolls back into place.
-  function cancelSwipe() {
-    const grid = $("#grid");
-    clearTimeout(swipeTimer);
-    moveGrid(grid, 0, reducedMotion() ? 0 : 200);
-    swipeTimer = setTimeout(() => resetGridPosition(grid), 220);
-  }
-
-  function renderSummary() {
-    const days = state.ledger.days;
-    const month = state.month.getMonth();
-    const idx = days.findIndex((d) => parseISO(d.date).getMonth() === month);
-    const inMonth = days.filter((d) => parseISO(d.date).getMonth() === month);
-    const opening = idx > 0 ? days[idx - 1].balance : state.ledger.opening;
-    let income = 0, expense = 0, adjust = 0, lowest = Infinity;
-    for (const d of inMonth) { income += d.income; expense += d.expense; adjust += (d.adjustment || 0) + (d.start_adjustment || 0); lowest = Math.min(lowest, d.balance); }
-    const closing = inMonth.length ? inMonth[inMonth.length - 1].balance : opening;
-    const row = (label, value, cls) => [h("dt", null, label), h("dd", { class: cls || "" }, value)];
-    $("#summary").replaceChildren(
-      h("div", { class: "side-head" }, h("h2", null, t("sum.title"))),
-      h("dl", { class: "summary-grid" },
-        row(t("sum.start"), money(opening)),
-        row(t("sum.income"), `+${money(income)}`, "amt inc"),
-        row(t("sum.expenses"), `−${money(expense)}`, "amt exp"),
-        adjust ? row(t("sum.balanceSet"), `${adjust > 0 ? "+" : "−"}${money(Math.abs(adjust))}`, adjust > 0 ? "amt inc" : "amt exp") : null,
-        row(t("sum.end"), money(closing), closing < 0 ? "total amt exp" : "total"),
-        row(t("sum.lowest"), money(lowest === Infinity ? opening : lowest), lowest < 0 ? "amt exp" : "")),
-    );
-  }
-
-  function renderCategories() {
-    const cats = [...new Set([...state.events.values()].map((e) => e.category).filter(Boolean))].sort();
-    $("#categories").replaceChildren(...cats.map((c) => h("option", { value: c })));
-  }
-
-  // ---------- day dialog ----------
-
-  function openDay(dateIso, keepOpen) {
-    const day = state.ledger && state.ledger.days.find((d) => d.date === dateIso);
-    if (!day) { if (keepOpen) $("#day-dialog").close(); return; }
-    state.dayOpen = dateIso;
-    $("#day-title").textContent = I18N.capitalize(fmtDate(parseISO(dateIso), LONG_DATE));
-    const hasOverride = day.override !== undefined && day.override !== null;
-    $("#day-balance").textContent = t("day.balance", { amount: money(day.balance) }) +
-      (hasOverride ? t("day.balanceManual", { diff: `${day.adjustment >= 0 ? "+" : "−"}${money(Math.abs(day.adjustment))}` }) : "");
-    $("#day-add").hidden = !canEdit();
-    $("#day-set-balance").hidden = !canEdit();
-    const items = day.entries.map((e) => h("li", null,
-      h("button", { type: "button", onclick: () => openEvent(e.event_id, dateIso) },
-        h("span", null, e.title, e.category ? h("span", { class: "muted small" }, ` · ${e.category}`) : null,
-          e.recurring ? h("span", { class: "muted small" }, " ↻") : null),
-        h("span", { class: `amt ${e.amount >= 0 ? "inc" : "exp"}` }, money(e.amount)))));
-    $("#day-entries").replaceChildren(...(items.length ? items : [h("li", { class: "muted" }, t("day.nothing"))]));
-    const dlg = $("#day-dialog");
-    if (!dlg.open) dlg.showModal();
-  }
-
-  // ---------- event dialog ----------
-
-  function openEvent(eventId, occurrenceDate, newDate) {
-    const f = $("#event-form");
-    f.reset();
-    showError($("#event-error"), "");
-    const ev = eventId ? state.events.get(eventId) : null;
-    state.editing = { event: ev, occurrenceDate };
-    const readOnly = !canEdit();
-    $("#event-dialog-title").textContent = t(ev ? (readOnly ? "ev.view" : "ev.edit") : "ev.new");
-    if (ev) {
-      f.kind.value = ev.amount >= 0 ? "income" : "expense";
-      f.title.value = ev.title;
-      f.amount.value = centsToInput(ev.amount);
-      f.category.value = ev.category;
-      f.start_date.value = ev.start_date;
-      f.recurrence.value = ev.recurrence;
-      f.interval.value = String(ev.interval || 1);
-      f.until_date.value = ev.until_date || "";
-      f.note.value = ev.note;
-    } else {
-      f.start_date.value = newDate || iso(new Date());
-      f.recurrence.value = "none";
-      f.interval.value = "1";
-    }
-    $("#event-delete").hidden = !ev || readOnly;
-    $("#event-delete").textContent = t(ev && ev.recurrence !== "none" ? "ev.deleteAll" : "ev.delete");
-    $("#event-skip").hidden = !ev || readOnly || ev.recurrence === "none" || !occurrenceDate;
-    for (const el of f.elements) {
-      if (el.matches("[data-close]")) continue;
-      el.disabled = readOnly && el.type !== "button";
-    }
-    f.querySelector("button[type=submit]").hidden = readOnly;
-    updateRepeatLabels();
-    updateUntil();
-    const dlg = $("#event-dialog");
-    if (!dlg.open) dlg.showModal();
-    if (!readOnly) f.title.focus();
-  }
-
-  // The "monthly on day N" / "monthly on the first Monday" options are derived
-  // from the chosen date, so their labels follow it.
-  function updateRepeatLabels() {
-    const f = $("#event-form");
-    const dayOpt = f.recurrence.querySelector("option[value=monthly_day]");
-    const nthOpt = f.recurrence.querySelector("option[value=monthly_nth]");
-    const v = f.start_date.value;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) {
-      dayOpt.textContent = t("rec.monthly_day");
-      nthOpt.textContent = t("rec.monthly_nth");
-      return;
-    }
-    const d = parseISO(v);
-    const n = d.getDate();
-    dayOpt.textContent = t("rec.dayN", { n }) + (n > 28 ? t("rec.dayNSkips") : "");
-    nthOpt.textContent = I18N.monthlyNthLabel(d);
-  }
-
-  function updateUntil() {
-    const f = $("#event-form");
-    $("#until-field").hidden = f.recurrence.value === "none";
-    $("#interval-field").hidden = f.recurrence.value !== "weeks";
-    // Disabled while hidden so an unused value never blocks saving.
-    f.interval.disabled = f.recurrence.value !== "weeks" || !canEdit();
-  }
-  // "Repeat every X weeks": X must be a whole number from 1 to 520; returns NaN otherwise.
-  const MAX_WEEKS_INTERVAL = 520;
-  function parseInterval(raw) {
-    const s = String(raw || "").trim();
-    if (!/^\d+$/.test(s)) return NaN;
-    const n = Number(s);
-    return n >= 1 && n <= MAX_WEEKS_INTERVAL ? n : NaN;
-  }
-
-  async function onEventSubmit(ev) {
-    ev.preventDefault();
-    const f = ev.target;
-    const cents = parseMoney(f.amount.value);
-    if (!f.title.value.trim()) return showError($("#event-error"), t("ev.errTitle"));
-    if (!Number.isFinite(cents) || cents === 0) return showError($("#event-error"), t("ev.errAmount"));
-    if (!f.start_date.value) return showError($("#event-error"), t("ev.errDate"));
-    const interval = f.recurrence.value === "weeks" ? parseInterval(f.interval.value) : 1;
-    if (!Number.isFinite(interval)) return showError($("#event-error"), t("ev.errInterval", { max: MAX_WEEKS_INTERVAL }));
-    const body = {
-      title: f.title.value,
-      amount: f.kind.value === "income" ? Math.abs(cents) : -Math.abs(cents),
-      category: f.category.value,
-      note: f.note.value,
-      start_date: f.start_date.value,
-      recurrence: f.recurrence.value,
-      interval,
-      until_date: f.recurrence.value === "none" ? "" : f.until_date.value,
-    };
-    const existing = state.editing && state.editing.event;
-    const occurrenceDate = state.editing && state.editing.occurrenceDate;
-    // A repeating transaction opened from one of its days: ask whether the
-    // changes are for that day only or for all repeats.
-    if (existing && existing.recurrence !== "none" && occurrenceDate) {
-      openScope(existing, occurrenceDate, body);
-      return;
-    }
-    await saveEvent(existing ? "all" : "new", existing, body);
-  }
-
-  // scope: "new" (create), "all" (the whole series) or "one" (only the day
-  // occurrenceDate of a repeating transaction).
-  async function saveEvent(scope, existing, body, occurrenceDate) {
-    const calId = state.calendar.id;
-    try {
-      if (scope === "one") {
-        // If the date was not changed, the single transaction stays on its own day.
-        const date = body.start_date === existing.start_date ? occurrenceDate : body.start_date;
-        await api("POST", `/calendars/${calId}/events/${existing.id}/occurrence`,
-          { ...body, start_date: date, recurrence: "none", interval: 1, until_date: "", date: occurrenceDate });
-      } else if (scope === "all") {
-        await api("PUT", `/calendars/${calId}/events/${existing.id}`, body);
-      } else {
-        await api("POST", `/calendars/${calId}/events`, body);
-      }
-      $("#event-dialog").close();
-      toast(t(scope === "one" ? "toast.savedOne" : scope === "all" ? "toast.savedAll" : "toast.saved"));
-      await refresh();
-    } catch (e) {
-      showError($("#event-error"), e.message);
-    }
-  }
-
-  function openScope(existing, occurrenceDate, body) {
-    state.pendingSave = { existing, occurrenceDate, body };
-    // Changing how it repeats only makes sense for the whole series.
-    const repeatChanged = body.recurrence !== existing.recurrence ||
-      (body.interval || 1) !== (existing.interval || 1) ||
-      (body.until_date || "") !== (existing.until_date || "");
-    const day = fmtDate(parseISO(occurrenceDate), LONG_DATE);
-    $("#scope-text").textContent = t("scope.text", { title: existing.title, day });
-    $("#scope-one").disabled = repeatChanged;
-    $("#scope-hint").hidden = !repeatChanged;
-    $("#scope-dialog").showModal();
-    (repeatChanged ? $("#scope-all") : $("#scope-one")).focus();
-  }
-
-  async function onScopeChoice(scope) {
-    const p = state.pendingSave;
-    if (!p) return;
-    state.pendingSave = null;
-    $("#scope-dialog").close();
-    await saveEvent(scope, p.existing, p.body, p.occurrenceDate);
-  }
-
-  async function onEventDelete() {
-    const e = state.editing && state.editing.event;
-    if (!e) return;
-    const msg = t(e.recurrence !== "none" ? "ev.confirmDeleteAll" : "ev.confirmDelete", { title: e.title });
-    if (!confirm(msg)) return;
-    try {
-      await api("DELETE", `/calendars/${state.calendar.id}/events/${e.id}`);
-      $("#event-dialog").close();
-      toast(t("toast.deleted"));
-      await refresh();
-    } catch (err) {
-      showError($("#event-error"), err.message);
-    }
-  }
-
-  async function onEventSkip() {
-    const { event: e, occurrenceDate } = state.editing || {};
-    if (!e || !occurrenceDate) return;
-    try {
-      await api("POST", `/calendars/${state.calendar.id}/events/${e.id}/skip`, { date: occurrenceDate });
-      $("#event-dialog").close();
-      toast(t("toast.removedDay"));
-      await refresh();
-    } catch (err) {
-      showError($("#event-error"), err.message);
-    }
-  }
-
-  // ---------- balance on a specific day ----------
-
-  function openBalance(dateIso) {
-    const day = state.ledger && state.ledger.days.find((d) => d.date === dateIso);
-    if (!day || !canEdit()) return;
-    const f = $("#balance-form");
-    f.reset();
-    showError($("#balance-error"), "");
-    state.balanceDate = dateIso;
-    const hasOverride = day.override !== undefined && day.override !== null;
-    const calculated = day.balance - (hasOverride ? day.adjustment : 0);
-    $("#balance-day").textContent = I18N.capitalize(fmtDate(parseISO(dateIso), LONG_DATE)) +
-      t("bal.calculated", { amount: money(calculated) });
-    f.balance.value = plainAmount(day.balance);
-    $("#balance-clear").hidden = !hasOverride;
-    $("#balance-dialog").showModal();
-    f.balance.focus();
-    f.balance.select();
-  }
-
-  async function onBalanceSubmit(ev) {
-    ev.preventDefault();
-    const f = ev.target;
-    const cents = parseMoney(f.balance.value);
-    if (!Number.isFinite(cents)) return showError($("#balance-error"), t("bal.err"));
-    try {
-      await api("PUT", `/calendars/${state.calendar.id}/balances/${state.balanceDate}`, { balance: cents });
-      $("#balance-dialog").close();
-      toast(t("toast.balanceSet"));
-      await refresh();
-    } catch (e) {
-      showError($("#balance-error"), e.message);
-    }
-  }
-
-  async function clearBalance(dateIso) {
-    try {
-      await api("DELETE", `/calendars/${state.calendar.id}/balances/${dateIso}`);
-      if ($("#balance-dialog").open) $("#balance-dialog").close();
-      toast(t("toast.balanceRemoved"));
-      await refresh();
-    } catch (e) {
-      if ($("#balance-dialog").open) showError($("#balance-error"), e.message);
-      else toast(e.message);
-    }
-  }
-
-  // ---------- right-click menu on a day ----------
-
-  function openDayMenu(ev, dateIso) {
-    ev.preventDefault();
-    const day = state.ledger && state.ledger.days.find((d) => d.date === dateIso);
-    if (!day) return;
-    const hasOverride = day.override !== undefined && day.override !== null;
-    const item = (label, fn, cls) => h("button", {
-      type: "button", role: "menuitem", class: cls || null,
-      onclick: () => { closeDayMenu(); fn(); },
-    }, label);
-    const items = [
-      h("div", { class: "ctx-head" }, fmtDate(parseISO(dateIso), { weekday: "short", day: "numeric", month: "short", year: "numeric" }) +
-        ` · ${money(day.balance)}`),
-      item(t("menu.open"), () => openDay(dateIso)),
-    ];
-    if (canEdit()) {
-      items.push(
-        item(t("menu.addExpense"), () => { openEvent(null, null, dateIso); $("#event-form").kind.value = "expense"; }),
-        item(t("menu.addIncome"), () => { openEvent(null, null, dateIso); $("#event-form").kind.value = "income"; }),
-        h("hr", { role: "separator" }),
-        item(t(hasOverride ? "menu.changeBalance" : "menu.setBalance"), () => openBalance(dateIso)));
-      if (hasOverride) items.push(item(t("menu.removeBalance"), () => clearBalance(dateIso), "danger"));
-    }
-    const menu = $("#day-menu");
-    menu.replaceChildren(...items);
-    menu.hidden = false;
-    // Keyboard-triggered context menus report (0, 0): anchor to the day cell instead.
-    let x = ev.clientX, y = ev.clientY;
-    if (!x && !y && ev.currentTarget && ev.currentTarget.getBoundingClientRect) {
-      const r = ev.currentTarget.getBoundingClientRect();
-      x = r.left + 8;
-      y = r.top + 8;
-    }
-    const mw = menu.offsetWidth, mh = menu.offsetHeight;
-    x = Math.max(4, Math.min(x, window.innerWidth - mw - 4));
-    y = Math.max(4, Math.min(y, window.innerHeight - mh - 4));
-    menu.style.left = `${x}px`;
-    menu.style.top = `${y}px`;
-    state.menuReturn = ev.currentTarget || null;
-    const first = menu.querySelector("button");
-    if (first) first.focus();
-  }
-
-  function closeDayMenu(restoreFocus) {
-    const menu = $("#day-menu");
-    if (menu.hidden) return;
-    menu.hidden = true;
-    menu.replaceChildren();
-    if (restoreFocus && state.menuReturn && state.menuReturn.isConnected) state.menuReturn.focus();
-    state.menuReturn = null;
-  }
-
-  function onMenuKey(e) {
-    const buttons = [...$("#day-menu").querySelectorAll("button")];
-    const i = buttons.indexOf(document.activeElement);
-    if (e.key === "Escape") { e.preventDefault(); closeDayMenu(true); }
-    else if (e.key === "ArrowDown") { e.preventDefault(); buttons[(i + 1) % buttons.length].focus(); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); buttons[(i - 1 + buttons.length) % buttons.length].focus(); }
-    else if (e.key === "Home") { e.preventDefault(); buttons[0].focus(); }
-    else if (e.key === "End") { e.preventDefault(); buttons[buttons.length - 1].focus(); }
-    else if (e.key === "Tab") closeDayMenu();
-  }
-
-  // ---------- calendar dialog ----------
-
-  function openCalendarDialog(edit) {
-    const f = $("#calendar-form");
-    f.reset();
-    showError($("#calendar-error"), "");
-    const c = edit ? state.calendar : null;
-    $("#calendar-dialog-title").textContent = t(c ? "cal.settings" : "cal.new");
-    f.name.value = c ? c.name : (state.calendars.length ? "" : t("cal.defaultName"));
-    f.currency.value = c ? c.currency : "EUR";
-    f.start_balance.value = c ? plainAmount(c.start_balance) : "";
-    f.start_date.value = c ? c.start_date : iso(new Date());
-    $("#calendar-delete").hidden = !c || c.role !== "owner";
-    $("#import-box").hidden = !!c;
-    f.dataset.mode = c ? "edit" : "create";
-    $("#calendar-dialog").showModal();
-    f.name.focus();
-  }
-
-  async function onCalendarSubmit(ev) {
-    ev.preventDefault();
-    const f = ev.target;
-    const bal = f.start_balance.value.trim() === "" ? 0 : parseMoney(f.start_balance.value);
-    if (!Number.isFinite(bal)) return showError($("#calendar-error"), t("cal.errBalance"));
-    const body = {
-      name: f.name.value,
-      currency: f.currency.value.trim().toUpperCase(),
-      start_balance: bal,
-      start_date: f.start_date.value,
-    };
-    try {
-      let cal;
-      if (f.dataset.mode === "edit") cal = await api("PATCH", `/calendars/${state.calendar.id}`, body);
-      else cal = await api("POST", "/calendars", body);
-      $("#calendar-dialog").close();
-      localStorageSet("calendar", cal.id);
-      await loadCalendars(cal.id);
-    } catch (e) {
-      showError($("#calendar-error"), e.message);
-    }
-  }
-
-  async function onCalendarDelete() {
-    if (!state.calendar) return;
-    if (!confirm(t("cal.confirmDelete", { name: state.calendar.name }))) return;
-    try {
-      await api("DELETE", `/calendars/${state.calendar.id}`);
-      $("#calendar-dialog").close();
-      state.calendar = null;
-      await loadCalendars();
-    } catch (e) {
-      showError($("#calendar-error"), e.message);
-    }
-  }
-
-  // ---------- share dialog ----------
-
-  async function openShare() {
-    showError($("#share-error"), "");
-    $("#share-form").reset();
-    prepareExport();
-    const owner = state.calendar.role === "owner";
-    $("#share-add").hidden = !owner;
-    $("#share-submit").hidden = !owner;
-    $("#member-list").replaceChildren(h("li", { class: "muted" }, t("share.loading")));
-    $("#share-dialog").showModal();
-    await renderMembers();
-  }
-
-  async function renderMembers() {
-    const owner = state.calendar.role === "owner";
-    const calId = state.calendar.id;
-    try {
-      const [members, invites] = await Promise.all([
-        api("GET", `/calendars/${calId}/members`),
-        api("GET", `/calendars/${calId}/invites`),
-      ]);
-      const roleLabel = (r) => (["owner", "editor", "viewer"].includes(r) ? t(`share.role.${r}`) : r);
-      const rows = members.map((m) => {
-        const self = m.user_id === state.user.id;
-        const canRemove = m.role !== "owner" && (owner || self);
-        let access;
-        if (owner && m.role !== "owner") {
-          access = h("select", { class: "role-select", "aria-label": t("share.accessFor", { name: m.display_name }), onchange: (e) => changeRole(m, e.target) },
-            h("option", { value: "editor", selected: m.role === "editor" }, t("share.canEdit")),
-            h("option", { value: "viewer", selected: m.role === "viewer" }, t("share.canView")));
-        } else {
-          access = h("span", { class: "muted small" }, roleLabel(m.role));
-        }
-        return h("li", null,
-          h("div", { class: "who" }, h("span", null, m.display_name + (self ? t("share.you") : "")), h("span", { class: "muted small" }, m.email)),
-          access,
-          canRemove ? h("button", { type: "button", class: "btn ghost small danger", onclick: () => removeMember(m, self) }, t(self ? "share.leave" : "share.remove")) : null);
-      });
-      for (const inv of invites) {
-        rows.push(h("li", null,
-          h("div", { class: "who" }, h("span", null, inv.email), h("span", { class: "muted small" }, t("share.invited"))),
-          h("span", { class: "muted small" }, roleLabel(inv.role)),
-          owner ? h("button", { type: "button", class: "btn ghost small danger", onclick: () => removeInvite(inv) }, t("share.cancelInvite")) : null));
-      }
-      $("#member-list").replaceChildren(...rows);
-    } catch (e) {
-      showError($("#share-error"), e.message);
-    }
-  }
-
-  async function changeRole(m, select) {
-    showError($("#share-error"), "");
-    try {
-      await api("PATCH", `/calendars/${state.calendar.id}/members/${m.user_id}`, { role: select.value });
-      toast(t("share.accessUpdated"));
-      await renderMembers();
-    } catch (e) {
-      select.value = m.role;
-      showError($("#share-error"), e.message);
-    }
-  }
-
-  async function removeInvite(inv) {
-    if (!confirm(t("share.confirmCancelInvite", { email: inv.email }))) return;
-    try {
-      await api("DELETE", `/calendars/${state.calendar.id}/invites/${encodeURIComponent(inv.email)}`);
-      await renderMembers();
-    } catch (e) {
-      showError($("#share-error"), e.message);
-    }
-  }
-
-  async function removeMember(m, self) {
-    if (!confirm(self ? t("share.confirmLeave") : t("share.confirmRemove", { name: m.display_name }))) return;
-    try {
-      await api("DELETE", `/calendars/${state.calendar.id}/members/${m.user_id}`);
-      if (self) {
-        $("#share-dialog").close();
-        state.calendar = null;
-        await loadCalendars();
-      } else {
-        await renderMembers();
-      }
-    } catch (e) {
-      showError($("#share-error"), e.message);
-    }
-  }
-
-  async function onShareSubmit(ev) {
-    ev.preventDefault();
-    const f = ev.target;
-    showError($("#share-error"), "");
-    try {
-      const res = await api("POST", `/calendars/${state.calendar.id}/members`, { email: f.email.value, role: f.role.value });
-      f.email.value = "";
-      toast(t(res && res.user_id ? "share.granted" : "share.invitedToast"));
-      await renderMembers();
-    } catch (e) {
-      showError($("#share-error"), e.message);
-    }
-  }
-
-  // ---------- export as a JSON file (send via Gmail, Telegram, ...) ----------
-  // The export is fetched when the share dialog opens, so that "Send file…" can
-  // call the system share sheet directly from the tap (iOS Safari only allows
-  // it during a user gesture, which an awaited network request would end).
-  let exportFile = null; // { calId, promise, file }
-
-  function exportFileName(name) {
-    const slug = String(name || "calendar").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
-      .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "calendar";
-    return `eurofish-${slug}-${iso(new Date())}.json`;
-  }
-
-  function canShareFiles() {
-    if (!navigator.share || !navigator.canShare || typeof File !== "function") return false;
-    try {
-      return navigator.canShare({ files: [new File(["{}"], "test.json", { type: "application/json" })] });
-    } catch { return false; }
-  }
-
-  function prepareExport() {
-    const cal = state.calendar;
-    $("#export-share").hidden = !canShareFiles();
-    const entry = { calId: cal.id, file: null, promise: null };
-    entry.promise = api("GET", `/calendars/${cal.id}/export`).then((data) => {
-      const text = JSON.stringify(data, null, 2) + "\n";
-      entry.file = new File([text], exportFileName(data.calendar && data.calendar.name), { type: "application/json" });
-      return entry.file;
-    });
-    entry.promise.catch(() => { /* reported when the user exports */ });
-    exportFile = entry;
-  }
-
-  async function getExportFile() {
-    if (!exportFile || !state.calendar || exportFile.calId !== state.calendar.id) prepareExport();
-    if (exportFile.file) return exportFile.file;
-    try {
-      return await exportFile.promise;
-    } catch (e) {
-      exportFile = null; // try again on the next tap
-      throw e;
-    }
-  }
-
-  function downloadFile(file) {
-    const url = URL.createObjectURL(file);
-    const a = h("a", { href: url, download: file.name, hidden: true });
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-  }
-
-  async function onExportShare() {
-    showError($("#share-error"), "");
-    try {
-      const file = exportFile && exportFile.file && exportFile.calId === (state.calendar && state.calendar.id)
-        ? exportFile.file : await getExportFile();
-      if (!canShareFiles() || !navigator.canShare({ files: [file] })) {
-        downloadFile(file);
-        toast(t("export.downloaded"));
-        return;
-      }
-      await navigator.share({ files: [file], title: file.name });
-    } catch (e) {
-      if (e && e.name === "AbortError") return; // share sheet dismissed
-      if (e && e.name === "NotAllowedError" && exportFile && exportFile.file) {
-        downloadFile(exportFile.file);
-        toast(t("export.notAllowed"));
-        return;
-      }
-      showError($("#share-error"), (e && e.message) || t("export.failed"));
-    }
-  }
-
-  async function onExportDownload() {
-    showError($("#share-error"), "");
-    try {
-      downloadFile(await getExportFile());
-      toast(t("export.downloaded"));
-    } catch (e) {
-      showError($("#share-error"), e.message);
-    }
-  }
-
-  // ---------- import from a JSON export file ----------
-  // Creates a new calendar (owned by the current user) from a file produced
-  // by "Send file…" / "Download .json".
-  const MAX_IMPORT_BYTES = 1024 * 1024;
-
-  function chooseImportFile() {
-    const input = $("#import-file");
-    input.value = "";
-    input.click();
-  }
-
-  function importFailed(msg) {
-    if ($("#calendar-dialog").open) showError($("#calendar-error"), msg);
-    else toast(msg);
-  }
-
-  async function onImportFile(ev) {
-    const file = ev.target.files && ev.target.files[0];
-    if (!file) return;
-    if ($("#calendar-dialog").open) showError($("#calendar-error"), "");
-    if (file.size > MAX_IMPORT_BYTES) return importFailed(t("import.tooLarge"));
-    let data;
-    try {
-      data = JSON.parse(await file.text());
-    } catch {
-      return importFailed(t("import.invalidJson"));
-    }
-    if (!data || typeof data !== "object" || data.format !== "eurofish-calendar") {
-      return importFailed(t("import.notExport"));
-    }
-    const buttons = [$("#import-choose"), $("#empty-import")];
-    buttons.forEach((b) => { b.disabled = true; });
-    try {
-      const res = await api("POST", "/calendars/import", data);
-      if ($("#calendar-dialog").open) $("#calendar-dialog").close();
-      closeSidebar();
-      localStorageSet("calendar", res.calendar.id);
-      await loadCalendars(res.calendar.id);
-      const n = res.events;
-      toast(tn("import.done", n, { name: res.calendar.name }));
-    } catch (e) {
-      importFailed(e.message);
-    } finally {
-      buttons.forEach((b) => { b.disabled = false; });
-      ev.target.value = "";
-    }
-  }
-
-  // ---------- colour theme (light/dark, pink, purple, ...) ----------
-  // The themes and the stored choice live in theme.js, which applies the
-  // theme before the page is drawn; this fills the picker in the sidebar.
   function initThemePicker() {
     const select = $("#theme-select");
-    const themes = window.EurofishTheme;
-    if (!select) return;
+    const themes = window.StravallTheme;
     if (!themes) { select.closest(".theme-picker").hidden = true; return; }
     fillThemePicker();
     select.addEventListener("change", () => {
       select.value = themes.set(select.value);
+      onThemeChange();
     });
+    if (window.matchMedia) {
+      const mq = window.matchMedia("(prefers-color-scheme: dark)");
+      const fn = () => { if (themes.get() === "auto") onThemeChange(); };
+      if (mq.addEventListener) mq.addEventListener("change", fn);
+      else if (mq.addListener) mq.addListener(fn);
+    }
   }
 
-  // (Re)builds the theme options with labels in the UI language.
+  function onThemeChange() {
+    MapView.restyle();
+    if (!$("#app-view").hidden) renderSelected();
+  }
+
   function fillThemePicker() {
     const select = $("#theme-select");
-    const themes = window.EurofishTheme;
-    if (!select || !themes) return;
+    const themes = window.StravallTheme;
+    if (!themes) return;
     const label = (key, fallback) => { const v = t(key); return v === key ? fallback : v; };
     const groups = new Map();
     const nodes = [];
@@ -1231,298 +1504,132 @@
     select.value = themes.get();
   }
 
-  // ---------- language (English, Russian, Spanish) ----------
-  // "System" (the default) follows the language set on the system, on
-  // desktop and on phones; the choice is remembered in this browser.
   function fillLanguagePicker() {
     const select = $("#lang-select");
-    if (!select) return;
     select.replaceChildren(...I18N.list().map((l) => h("option", { value: l.id }, l.label)));
     select.value = I18N.get();
   }
 
-  function initLanguagePicker() {
-    const select = $("#lang-select");
-    if (!select) return;
-    fillLanguagePicker();
-    select.addEventListener("change", () => { I18N.set(select.value); });
-    I18N.onChange(relocalize);
+  function fillUnitsPicker() {
+    const select = $("#units-select");
+    select.replaceChildren(
+      h("option", { value: "metric" }, t("units.metric")),
+      h("option", { value: "imperial" }, t("units.imperial")));
+    select.value = state.units;
   }
 
-  // Redraws all visible text after the language changed.
+  function initPickers() {
+    initThemePicker();
+    fillLanguagePicker();
+    $("#lang-select").addEventListener("change", () => { I18N.set($("#lang-select").value); });
+    I18N.onChange(relocalize);
+    fillUnitsPicker();
+    $("#units-select").addEventListener("change", () => {
+      state.units = $("#units-select").value === "imperial" ? "imperial" : "metric";
+      localStorageSet("units", state.units);
+      if (!$("#app-view").hidden) render(false);
+    });
+  }
+
   function relocalize() {
     I18N.applyStatic();
     $("#auth-submit").textContent = t(state.authMode === "signup" ? "auth.createAccount" : "auth.signIn");
     setPasswordVisible($("#auth-form").password.type === "text");
     fillThemePicker();
     fillLanguagePicker();
-    if ($("#event-form").start_date.value) updateRepeatLabels();
+    fillUnitsPicker();
+    syncMarkersButton();
     if ($("#app-view").hidden) return;
-    renderCalendarList();
-    renderMonthTitle();
-    if (state.calendar && state.ledger) {
-      renderGrid();
-      renderSummary();
-    }
+    if (state.activities.length) fillSportFilter();
+    render(false);
+  }
+
+  function syncMarkersButton() {
+    const b = $("#toggle-markers");
+    b.setAttribute("aria-pressed", String(state.markers));
+    b.classList.toggle("active", state.markers);
   }
 
   // ---------- wiring ----------
 
-  function changeMonth(delta, swiped) {
-    state.month = new Date(state.month.getFullYear(), state.month.getMonth() + delta, 1);
-    state.slide = delta;
-    state.swipeIn = swiped ? delta : 0;
-    state.dayOpen = null;
-    refresh().catch((e) => {
-      // never leave the grid scrolled out of view
-      state.swipeIn = 0;
-      state.swiping = false;
-      resetGridPosition($("#grid"));
-      toast(e.message);
-    });
-  }
-
   function wire() {
     I18N.applyStatic();
-    initThemePicker();
-    initLanguagePicker();
+    initPickers();
+
     $("#tab-login").addEventListener("click", () => setAuthMode("login"));
     $("#tab-signup").addEventListener("click", () => setAuthMode("signup"));
     $("#auth-form").addEventListener("submit", onAuthSubmit);
     $("#password-toggle").addEventListener("click", togglePasswordVisible);
-    // Keep the focus (and the on-screen keyboard) in the password field.
     $("#password-toggle").addEventListener("pointerdown", (e) => e.preventDefault());
     setPasswordVisible(false);
     $("#logout").addEventListener("click", logout);
 
-    $("#prev-month").addEventListener("click", () => changeMonth(-1));
-    $("#next-month").addEventListener("click", () => changeMonth(1));
-    $("#today").addEventListener("click", () => {
-      const target = firstOfMonth(new Date());
-      const diff = Math.sign(target - state.month);
-      state.month = target;
-      changeMonth(0);
-      state.slide = diff;
-    });
     $("#menu-toggle").addEventListener("click", toggleSidebar);
     $("#app-view").classList.toggle("sidebar-hidden", localStorageGet("sidebar") === "hidden");
     syncMenuToggle();
+    if (narrowScreen) {
+      const fn = () => syncMenuToggle();
+      if (narrowScreen.addEventListener) narrowScreen.addEventListener("change", fn);
+      else if (narrowScreen.addListener) narrowScreen.addListener(fn);
+    }
 
-    $("#new-calendar").addEventListener("click", () => openCalendarDialog(false));
-    $("#empty-create").addEventListener("click", () => openCalendarDialog(false));
-    $("#empty-import").addEventListener("click", chooseImportFile);
-    $("#import-choose").addEventListener("click", chooseImportFile);
-    $("#import-file").addEventListener("change", onImportFile);
-    $("#edit-calendar").addEventListener("click", () => openCalendarDialog(true));
-    $("#calendar-form").addEventListener("submit", onCalendarSubmit);
-    $("#calendar-delete").addEventListener("click", onCalendarDelete);
+    let filterTimer = null;
+    $("#filter-text").addEventListener("input", () => { clearTimeout(filterTimer); filterTimer = setTimeout(() => applyFilter(true), 200); });
+    for (const id of ["#filter-sport", "#filter-from", "#filter-to"]) $(id).addEventListener("change", () => applyFilter(true));
+    $("#filter-clear").addEventListener("click", clearFilter);
 
-    $("#share-calendar").addEventListener("click", () => openShare().catch((e) => toast(e.message)));
-    $("#share-form").addEventListener("submit", onShareSubmit);
-    $("#export-share").addEventListener("click", onExportShare);
-    $("#export-download").addEventListener("click", onExportDownload);
+    $("#show-all").addEventListener("click", () => selectActivity(null));
+    $("#toggle-markers").addEventListener("click", () => {
+      state.markers = !state.markers;
+      localStorageSet("markers", state.markers ? "on" : "off");
+      syncMarkersButton();
+      MapView.redraw(false);
+      renderLegend(state.filtered);
+    });
+    syncMarkersButton();
 
-    $("#add-event").addEventListener("click", () => openEvent(null, null, iso(new Date())));
-    $("#day-add").addEventListener("click", () => openEvent(null, null, state.dayOpen));
-    $("#event-form").addEventListener("submit", onEventSubmit);
-    $("#event-form").recurrence.addEventListener("change", updateUntil);
-    $("#event-form").start_date.addEventListener("input", updateRepeatLabels);
-    $("#event-form").start_date.addEventListener("change", updateRepeatLabels);
-    $("#event-delete").addEventListener("click", onEventDelete);
-    $("#event-skip").addEventListener("click", onEventSkip);
-    $("#scope-one").addEventListener("click", () => onScopeChoice("one"));
-    $("#scope-all").addEventListener("click", () => onScopeChoice("all"));
-    $("#scope-dialog").addEventListener("close", () => { state.pendingSave = null; });
-    $("#day-dialog").addEventListener("close", () => { state.dayOpen = null; });
-    $("#day-set-balance").addEventListener("click", () => openBalance(state.dayOpen));
-    $("#balance-form").addEventListener("submit", onBalanceSubmit);
-    $("#balance-clear").addEventListener("click", () => clearBalance(state.balanceDate));
+    for (const id of ["#upload-btn", "#upload-side", "#empty-upload"]) $(id).addEventListener("click", openUpload);
+    $("#upload-choose").addEventListener("click", chooseFiles);
+    $("#upload-file").addEventListener("change", (e) => uploadFiles(e.target.files));
+    $("#delete-all").addEventListener("click", () => { $("#upload-dialog").close(); deleteAll(); });
+    $("#delete-filtered").addEventListener("click", () => { $("#upload-dialog").close(); deleteFiltered(); });
+    const zone = $("#drop-zone");
+    zone.addEventListener("click", chooseFiles);
+    zone.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); chooseFiles(); } });
+    wireDrop();
 
-    // Right-click menu on days.
-    const dayMenu = $("#day-menu");
-    dayMenu.addEventListener("keydown", onMenuKey);
-    dayMenu.addEventListener("contextmenu", (e) => e.preventDefault());
-    document.addEventListener("pointerdown", (e) => { if (!dayMenu.contains(e.target)) closeDayMenu(); }, true);
-    window.addEventListener("resize", () => closeDayMenu());
-    window.addEventListener("blur", () => closeDayMenu());
-    document.addEventListener("scroll", () => closeDayMenu(), true);
-    window.addEventListener("focus", () => { checkSharedCalendars(); });
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) checkSharedCalendars(); });
+    $("#edit-form").addEventListener("submit", onEditSubmit);
+    $("#edit-delete").addEventListener("click", onEditDelete);
 
     document.querySelectorAll("dialog").forEach(enhanceDialog);
-    // Touch: when a dialog closes the browser puts focus back on the tapped day,
-    // which then stays outlined as if it were selected. Drop that focus unless
-    // the last input was a keyboard (keyboard users keep their place).
-    let lastPointer = "";
-    document.addEventListener("pointerdown", (e) => { lastPointer = e.pointerType || ""; }, true);
-    document.addEventListener("keydown", () => { lastPointer = ""; }, true);
-    document.querySelectorAll("dialog").forEach((d) => d.addEventListener("close", () => {
-      if (lastPointer !== "touch" && lastPointer !== "pen") return;
-      const el = document.activeElement;
-      if (el && el.classList && el.classList.contains("day") && !document.querySelector("dialog[open]")) el.blur();
-    }));
-    wireSwipes();
-    watchDaySizes();
-    // Re-render the day balances when crossing the compact-cell breakpoint.
-    if (compactCells) {
-      const onCompact = () => { if (state.ledger && state.calendar) renderGrid(); };
-      if (compactCells.addEventListener) compactCells.addEventListener("change", onCompact);
-      else if (compactCells.addListener) compactCells.addListener(onCompact);
-    }
-    // ...and the transaction amounts when crossing the phone breakpoint.
-    if (narrowScreen) {
-      const onNarrow = () => { syncMenuToggle(); renderMonthTitle(); if (state.ledger && state.calendar) renderGrid(); };
-      if (narrowScreen.addEventListener) narrowScreen.addEventListener("change", onNarrow);
-      else if (narrowScreen.addListener) narrowScreen.addListener(onNarrow);
-    }
     document.querySelectorAll("[data-close]").forEach((b) =>
-      b.addEventListener("click", () => b.closest("dialog").close()));
-    // Close dialogs when clicking on the backdrop.
+      b.addEventListener("click", () => { if (!state.uploading) b.closest("dialog").close(); }));
     document.querySelectorAll("dialog").forEach((d) => d.addEventListener("click", (e) => {
-      if (e.target === d) d.close();
+      if (e.target === d && !state.uploading) d.close();
     }));
 
     document.addEventListener("keydown", (e) => {
-      if (!$("#day-menu").hidden) return; // the menu handles its own keys
-      if (e.target.closest("input, textarea, select, dialog") || $("#app-view").hidden || !state.calendar) return;
-      if (e.key === "ArrowLeft") changeMonth(-1);
-      if (e.key === "ArrowRight") changeMonth(1);
+      if (e.key !== "Escape" || $("#app-view").hidden || document.querySelector("dialog[open]")) return;
+      if (e.target.closest("input, textarea, select")) return;
+      if (state.selectedId) selectActivity(null);
     });
-  }
 
-  // ---------- touch swipes ----------
-  // Swipe the calendar left/right to change month; swipe the sidebar open from
-  // the left edge and closed again (it follows the finger).
-  function wireSwipes() {
-    const cal = $("#calendar");
-    const sidebar = $("#sidebar");
-    let sx = 0, sy = 0, st = 0, tracking = null, dragX = 0;
-    const narrow = () => window.matchMedia("(max-width: 820px)").matches;
-
-    const grid = $("#grid");
-
-    // Month swipe: the grid follows the finger horizontally, like a scroller.
-    let sw = null; // { x, y, dx, lock, samples: [[time, x]] }
-    let suppressClick = false;
-    const swipeAllowed = () => !state.swiping && !!state.calendar && !$("#app-view").hidden &&
-      !document.querySelector("dialog[open]") && !(narrow() && sidebar.classList.contains("open"));
-    cal.addEventListener("touchstart", (e) => {
-      sw = null;
-      if (e.touches.length !== 1 || !swipeAllowed()) return;
-      const x = e.touches[0].clientX;
-      if (x < 24 && narrow()) return; // edge swipe opens the sidebar instead
-      sw = { x, y: e.touches[0].clientY, dx: 0, lock: false, samples: [[Date.now(), x]] };
-    }, { passive: true });
-    cal.addEventListener("touchmove", (e) => {
-      if (!sw) return;
-      if (e.touches.length !== 1) { if (sw.lock) cancelSwipe(); sw = null; return; }
-      const x = e.touches[0].clientX, y = e.touches[0].clientY;
-      const dx = x - sw.x, dy = y - sw.y;
-      if (!sw.lock) {
-        if (Math.max(Math.abs(dx), Math.abs(dy)) < 8) return;
-        if (Math.abs(dx) < Math.abs(dy) * 1.2) { sw = null; return; } // vertical scroll
-        sw.lock = true;
-        grid.classList.remove("slide-next", "slide-prev", "fade");
-        clearTimeout(swipeTimer);
-        closeDayMenu();
-      }
-      if (e.cancelable) e.preventDefault(); // keep the page still while dragging
-      sw.dx = dx;
-      sw.samples.push([Date.now(), x]);
-      if (sw.samples.length > 6) sw.samples.shift();
-      moveGrid(grid, dx, 0);
-    }, { passive: false });
-    const swipeEnd = (e) => {
-      const s = sw;
-      sw = null;
-      if (!s || !s.lock) return;
-      suppressClick = true; // the lifted finger must not open a day
-      setTimeout(() => { suppressClick = false; }, 400);
-      if (e.type === "touchcancel") { cancelSwipe(); return; }
-      const [t0, x0] = s.samples[0];
-      const [t1, x1] = s.samples[s.samples.length - 1];
-      const v = t1 > t0 ? (x1 - x0) / (t1 - t0) : 0; // px per ms
-      const w = gridWidth();
-      const flick = Math.abs(v) > 0.35 && Math.abs(s.dx) > 30 && Math.sign(v) === Math.sign(s.dx);
-      if (Math.abs(s.dx) > w * 0.25 || flick) commitSwipe(s.dx < 0 ? 1 : -1);
-      else cancelSwipe();
-    };
-    cal.addEventListener("touchend", swipeEnd, { passive: true });
-    cal.addEventListener("touchcancel", swipeEnd, { passive: true });
-    cal.addEventListener("click", (e) => {
-      if (!suppressClick) return;
-      suppressClick = false;
-      e.preventDefault();
-      e.stopPropagation();
-    }, true);
-
-    // Trackpads: a horizontal two-finger swipe scrolls the months the same way.
-    let wheelX = 0, wheelIdle = null, wheelLock = 0;
-    cal.addEventListener("wheel", (e) => {
-      if (e.ctrlKey || Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
-      e.preventDefault(); // no browser back/forward gesture
-      const now = Date.now();
-      if (state.swiping || now < wheelLock || !swipeAllowed()) { wheelLock = now + 250; return; } // swallow inertia
-      const w = gridWidth();
-      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? w : 1;
-      if (!wheelX) { grid.classList.remove("slide-next", "slide-prev", "fade"); clearTimeout(swipeTimer); closeDayMenu(); }
-      wheelX = Math.max(-w, Math.min(w, wheelX - e.deltaX * unit));
-      clearTimeout(wheelIdle);
-      if (Math.abs(wheelX) > w * 0.25) {
-        const dir = wheelX < 0 ? 1 : -1;
-        wheelX = 0;
-        wheelLock = now + 250;
-        commitSwipe(dir);
-        return;
-      }
-      moveGrid(grid, wheelX, 0);
-      wheelIdle = setTimeout(() => { wheelX = 0; cancelSwipe(); }, 160);
-    }, { passive: false });
-
-    document.addEventListener("touchstart", (e) => {
-      if (e.touches.length !== 1 || !narrow() || $("#app-view").hidden || document.querySelector("dialog[open]")) return;
-      const x = e.touches[0].clientX;
-      const open = sidebar.classList.contains("open");
-      if (open || x < 24) {
-        tracking = open ? "close" : "open";
-        sx = x; sy = e.touches[0].clientY; dragX = 0; st = Date.now();
-      }
-    }, { passive: true });
-    document.addEventListener("touchmove", (e) => {
-      if (!tracking) return;
-      const dx = e.touches[0].clientX - sx, dy = e.touches[0].clientY - sy;
-      if (!sidebar.classList.contains("dragging")) {
-        if (Math.abs(dx) < 8) return;
-        if (Math.abs(dy) > Math.abs(dx)) { tracking = null; return; }
-        sidebar.classList.add("dragging");
-      }
-      const w = sidebar.offsetWidth || 260;
-      dragX = dx;
-      const offset = tracking === "close" ? Math.min(0, dx) : Math.min(0, -w + dx);
-      sidebar.style.transform = `translateX(${Math.max(-w, offset)}px)`;
-    }, { passive: true });
-    const end = () => {
-      if (!tracking) return;
-      const was = tracking;
-      tracking = null;
-      if (!sidebar.classList.contains("dragging")) return;
-      sidebar.classList.remove("dragging");
-      sidebar.style.transform = "";
-      const w = sidebar.offsetWidth || 260;
-      const fast = Date.now() - st < 300 && Math.abs(dragX) > 30;
-      if (was === "close") setSidebar(!(dragX < -w / 3 || (fast && dragX < 0)));
-      else setSidebar(dragX > w / 3 || (fast && dragX > 0));
-    };
-    document.addEventListener("touchend", end, { passive: true });
-    document.addEventListener("touchcancel", end, { passive: true });
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const c = $("#profile");
+        const d = state.selectedId && state.details.get(state.selectedId);
+        if (c && d) drawProfile(c, d.detail.profile);
+      }, 150);
+    });
   }
 
   async function boot() {
     wire();
     try {
-      const cfg = await api("GET", "/config");
-      state.signupEnabled = !!cfg.signup_enabled;
-    } catch { state.signupEnabled = false; }
+      state.config = { ...state.config, ...(await api("GET", "/config")) };
+    } catch { state.config.signup_enabled = false; }
     try {
       state.user = await api("GET", "/me");
     } catch { state.user = null; }

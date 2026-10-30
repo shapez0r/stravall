@@ -1,4 +1,4 @@
-module eurofish
+module stravall
 
 go 1.23
 

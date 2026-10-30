@@ -4,5 +4,4 @@ data
 dist
 *.db
 *.db-*
-*.ext4
 .env

@@ -1,6 +1,6 @@
--- eurofish initial schema (SQLite)
--- Money is stored as signed integer cents. Dates are ISO "YYYY-MM-DD" strings.
+-- stravall initial schema (SQLite)
 -- Timestamps are unix seconds. IDs are application-generated UUIDs.
+-- Distances are metres, durations seconds.
 
 CREATE TABLE users (
     id            VARCHAR(36)  NOT NULL PRIMARY KEY,
@@ -10,7 +10,7 @@ CREATE TABLE users (
     created_at    BIGINT       NOT NULL
 );
 
--- External identities (Google, Apple, ...) linked to a user. Reserved for upcoming OAuth/OIDC sign-in.
+-- External identities (Google, Apple, Strava ...) linked to a user. Reserved for upcoming OAuth/OIDC sign-in.
 CREATE TABLE auth_identities (
     provider   VARCHAR(32)  NOT NULL,
     subject    VARCHAR(255) NOT NULL,
@@ -29,45 +29,24 @@ CREATE TABLE sessions (
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 CREATE INDEX idx_sessions_expires ON sessions(expires_at);
 
-CREATE TABLE calendars (
+-- One uploaded activity. stats is a small JSON summary (listed for every
+-- activity), detail holds splits and the elevation profile, track the
+-- simplified route and preview a coarse version of it for the overview map.
+CREATE TABLE activities (
     id            VARCHAR(36)  NOT NULL PRIMARY KEY,
-    name          VARCHAR(100) NOT NULL,
-    currency      VARCHAR(3)   NOT NULL,
-    start_date    VARCHAR(10)  NOT NULL,
-    start_balance BIGINT       NOT NULL,
-    owner_id      VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    version       BIGINT       NOT NULL DEFAULT 1,
+    user_id       VARCHAR(36)  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name          VARCHAR(200) NOT NULL,
+    sport         VARCHAR(64)  NOT NULL DEFAULT '',
+    source_format VARCHAR(16)  NOT NULL,
+    file_name     VARCHAR(255) NOT NULL DEFAULT '',
+    content_hash  VARCHAR(64)  NOT NULL,
+    start_time    BIGINT       NOT NULL DEFAULT 0,
+    has_track     INTEGER      NOT NULL DEFAULT 0,
+    stats         TEXT         NOT NULL,
+    detail        TEXT         NOT NULL,
+    track         TEXT         NOT NULL,
+    preview       TEXT         NOT NULL,
     created_at    BIGINT       NOT NULL
 );
-
-CREATE TABLE calendar_members (
-    calendar_id VARCHAR(36) NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
-    user_id     VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role        VARCHAR(16) NOT NULL,
-    created_at  BIGINT      NOT NULL,
-    PRIMARY KEY (calendar_id, user_id)
-);
-CREATE INDEX idx_calendar_members_user ON calendar_members(user_id);
-
-CREATE TABLE events (
-    id          VARCHAR(36)  NOT NULL PRIMARY KEY,
-    calendar_id VARCHAR(36)  NOT NULL REFERENCES calendars(id) ON DELETE CASCADE,
-    title       VARCHAR(200) NOT NULL,
-    amount      BIGINT       NOT NULL,
-    category    VARCHAR(64)  NOT NULL DEFAULT '',
-    note        TEXT         NOT NULL,
-    start_date  VARCHAR(10)  NOT NULL,
-    recurrence  VARCHAR(16)  NOT NULL,
-    until_date  VARCHAR(10),
-    created_by  VARCHAR(36)  NOT NULL,
-    created_at  BIGINT       NOT NULL,
-    updated_at  BIGINT       NOT NULL
-);
-CREATE INDEX idx_events_calendar ON events(calendar_id);
-
--- Single occurrences of a recurring event that were removed ("skip this one").
-CREATE TABLE event_skips (
-    event_id VARCHAR(36) NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-    skip_date VARCHAR(10) NOT NULL,
-    PRIMARY KEY (event_id, skip_date)
-);
+CREATE UNIQUE INDEX uq_activities_hash ON activities(user_id, content_hash);
+CREATE INDEX idx_activities_user_start ON activities(user_id, start_time);

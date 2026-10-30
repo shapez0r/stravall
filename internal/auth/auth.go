@@ -38,7 +38,7 @@ func CheckPassword(hash, pw string) bool {
 
 // dummyHash is compared against when a user does not exist so that login
 // timing does not reveal which e-mail addresses are registered.
-var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("eurofish-timing-equaliser"), bcryptCost)
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("stravall-timing-equaliser"), bcryptCost)
 
 func BurnPasswordCheck(pw string) {
 	_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(pw))

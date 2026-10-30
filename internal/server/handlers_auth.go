@@ -11,8 +11,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
-	"eurofish/internal/auth"
-	"eurofish/internal/store"
+	"stravall/internal/auth"
+	"stravall/internal/store"
 )
 
 const sessionCacheTTL = time.Minute
@@ -73,10 +73,6 @@ func (s *Server) signup(c *fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusConflict, "an account with this e-mail already exists")
 		}
 		return err
-	}
-	// Calendars shared with this e-mail address before the account existed.
-	if err := s.store.AcceptInvites(c.UserContext(), u.ID, u.Email); err != nil {
-		s.log.Warn("accepting calendar invites failed", "user", u.ID, "err", err)
 	}
 	if err := s.startSession(c, u.ID); err != nil {
 		return err

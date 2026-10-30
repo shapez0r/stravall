@@ -1,7 +1,0 @@
-.git
-bin
-data
-dist
-*.db
-*.db-*
-.env
