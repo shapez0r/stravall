@@ -1,0 +1,36 @@
+# Bare-metal / VM install: copy the binary to /usr/local/bin/eurofish and
+# this unit to /etc/systemd/system/, then: systemctl enable --now eurofish
+[Unit]
+Description=eurofish budgeting calendar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/eurofish serve
+EnvironmentFile=-/etc/eurofish/eurofish.env
+Environment=EUROFISH_ADDR=:8080
+Environment=EUROFISH_DATA_DIR=/var/lib/eurofish
+DynamicUser=yes
+StateDirectory=eurofish
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

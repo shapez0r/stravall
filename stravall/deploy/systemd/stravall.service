@@ -1,0 +1,36 @@
+# Bare-metal / VM install: copy the binary to /usr/local/bin/stravall and
+# this unit to /etc/systemd/system/, then: systemctl enable --now stravall
+[Unit]
+Description=stravall route and activity statistics
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/stravall serve
+EnvironmentFile=-/etc/stravall/stravall.env
+Environment=STRAVALL_ADDR=:8082
+Environment=STRAVALL_DATA_DIR=/var/lib/stravall
+DynamicUser=yes
+StateDirectory=stravall
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

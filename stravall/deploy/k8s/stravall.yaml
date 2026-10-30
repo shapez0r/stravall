@@ -1,0 +1,56 @@
+# Kubernetes example for the scaled-out mode. Expects a reachable MariaDB and
+# Valkey (managed services or your own charts) and a Secret holding the DSN
+# and (optionally) the Google Maps key:
+#   kubectl create secret generic stravall \
+#     --from-literal=db-dsn='stravall:PASSWORD@tcp(mariadb:3306)/stravall?charset=utf8mb4' \
+#     --from-literal=google-maps-key='YOUR-BROWSER-KEY'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stravall
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: stravall }
+  template:
+    metadata:
+      labels: { app: stravall }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: stravall
+          image: stravall:latest
+          ports:
+            - containerPort: 8082
+          env:
+            - { name: STRAVALL_DB_DRIVER, value: mariadb }
+            - name: STRAVALL_DB_DSN
+              valueFrom: { secretKeyRef: { name: stravall, key: db-dsn } }
+            - name: STRAVALL_GOOGLE_MAPS_KEY
+              valueFrom: { secretKeyRef: { name: stravall, key: google-maps-key, optional: true } }
+            - { name: STRAVALL_CACHE_URL, value: "redis://valkey:6379/0" }
+            - { name: STRAVALL_PROXY_HEADER, value: X-Forwarded-For }
+            - { name: STRAVALL_COOKIE_SECURE, value: "true" }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8082 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8082 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            # Uploads (a whole Strava export) are held in memory while parsing.
+            limits: { memory: 1536Mi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stravall
+spec:
+  selector: { app: stravall }
+  ports:
+    - port: 80
+      targetPort: 8082

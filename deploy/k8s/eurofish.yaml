@@ -1,0 +1,51 @@
+# Kubernetes example for the scaled-out mode. Expects a reachable MariaDB and
+# Valkey (managed services or your own charts) and a Secret holding the DSN:
+#   kubectl create secret generic eurofish \
+#     --from-literal=db-dsn='eurofish:PASSWORD@tcp(mariadb:3306)/eurofish?charset=utf8mb4'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eurofish
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: eurofish }
+  template:
+    metadata:
+      labels: { app: eurofish }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: eurofish
+          image: eurofish:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: EUROFISH_DB_DRIVER, value: mariadb }
+            - name: EUROFISH_DB_DSN
+              valueFrom: { secretKeyRef: { name: eurofish, key: db-dsn } }
+            - { name: EUROFISH_CACHE_URL, value: "redis://valkey:6379/0" }
+            - { name: EUROFISH_PROXY_HEADER, value: X-Forwarded-For }
+            - { name: EUROFISH_COOKIE_SECURE, value: "true" }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eurofish
+spec:
+  selector: { app: eurofish }
+  ports:
+    - port: 80
+      targetPort: 8080
