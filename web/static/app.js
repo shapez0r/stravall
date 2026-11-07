@@ -241,6 +241,7 @@
   }
 
   function showAuth() {
+    setMapFullscreen(false);
     $("#app-view").hidden = true;
     $("#auth-view").hidden = false;
     $("#tab-signup").hidden = !state.config.signup_enabled;
@@ -1152,7 +1153,7 @@
       const g = window.google.maps;
       this.map = new g.Map(el, {
         center: { lat: 48, lng: 11 }, zoom: 4, mapTypeId: "roadmap", styles: themedMapStyles(),
-        streetViewControl: false, fullscreenControl: true, mapTypeControl: true, clickableIcons: false,
+        streetViewControl: false, fullscreenControl: false, mapTypeControl: true, clickableIcons: false,
         mapTypeControlOptions: { mapTypeIds: ["roadmap", "terrain", "satellite", "hybrid"] },
       });
       this.info = new g.InfoWindow();
@@ -1217,7 +1218,7 @@
         h("strong", null, a.name),
         h("div", null, `${fmtDate(startDate(a), SHORT_DATE)} · ${sportLabel(a.sport)}`),
         h("div", null, `${fmtDist(s.distance_m)} · ${fmtDuration(s.moving_s)} · ${fmtSpeed(s.avg_speed, a.sport)}`),
-        state.selectedId === id ? null : h("button", { type: "button", class: "btn small", onclick: () => { this.info.close(); selectActivity(id); } }, t("map.details")));
+        state.selectedId === id ? null : h("button", { type: "button", class: "btn small", onclick: () => { this.info.close(); setMapFullscreen(false); selectActivity(id); } }, t("map.details")));
       this.info.setContent(box);
       this.info.setPosition(latLng);
       this.info.open({ map: this.map });
@@ -1423,6 +1424,45 @@
     return Math.hypot(px - (ax + k * dx), py - (ay + k * dy));
   }
 
+  // ---------- fullscreen map ----------
+  // The map container covers the whole window (CSS); where the browser
+  // supports it, the Fullscreen API also hides the browser UI. iPhones have no
+  // element fullscreen, so there the CSS mode alone is used.
+  let nativeFullscreen = false;
+  function fullscreenElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+  function mapFullscreen() { return $("#map-wrap").classList.contains("fullscreen"); }
+  function syncFullscreenButton() {
+    const on = mapFullscreen();
+    const b = $("#map-fullscreen");
+    const label = t(on ? "map.exitFullscreen" : "map.fullscreen");
+    b.setAttribute("aria-pressed", String(on));
+    b.setAttribute("aria-label", label);
+    b.title = label;
+  }
+  function setMapFullscreen(on) {
+    const wrap = $("#map-wrap");
+    if (on === mapFullscreen()) return;
+    wrap.classList.toggle("fullscreen", on);
+    document.body.classList.toggle("map-fullscreen", on);
+    syncFullscreenButton();
+    const call = (fn, target) => {
+      try { const p = fn.call(target); if (p && p.catch) p.catch(() => {}); } catch { /* CSS mode only */ }
+    };
+    if (on) {
+      const req = wrap.requestFullscreen || wrap.webkitRequestFullscreen;
+      if (req) call(req, wrap);
+    } else if (fullscreenElement() === wrap) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (exit) call(exit, document);
+    }
+    requestAnimationFrame(() => MapView.redraw(false));
+  }
+  function onFullscreenChange() {
+    if (fullscreenElement() === $("#map-wrap")) { nativeFullscreen = true; return; }
+    // Native fullscreen ended (Esc, back gesture): leave the CSS mode too.
+    if (nativeFullscreen) { nativeFullscreen = false; setMapFullscreen(false); }
+  }
+
   // ---------- sidebar ----------
 
   const narrowScreen = window.matchMedia ? window.matchMedia("(max-width: 820px)") : null;
@@ -1539,6 +1579,7 @@
     fillLanguagePicker();
     fillUnitsPicker();
     syncMarkersButton();
+    syncFullscreenButton();
     if ($("#app-view").hidden) return;
     if (state.activities.length) fillSportFilter();
     render(false);
@@ -1587,6 +1628,10 @@
       renderLegend(state.filtered);
     });
     syncMarkersButton();
+    $("#map-fullscreen").addEventListener("click", () => setMapFullscreen(!mapFullscreen()));
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+    syncFullscreenButton();
 
     for (const id of ["#upload-btn", "#upload-side", "#empty-upload"]) $(id).addEventListener("click", openUpload);
     $("#upload-choose").addEventListener("click", chooseFiles);
@@ -1609,6 +1654,10 @@
     }));
 
     document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && mapFullscreen() && !document.querySelector("dialog[open]")) {
+        setMapFullscreen(false);
+        return;
+      }
       if (e.key !== "Escape" || $("#app-view").hidden || document.querySelector("dialog[open]")) return;
       if (e.target.closest("input, textarea, select")) return;
       if (state.selectedId) selectActivity(null);

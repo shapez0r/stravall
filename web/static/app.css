@@ -703,7 +703,7 @@ dialog.closing::backdrop { animation: ef-fade-out .16s steps(3, end) forwards; }
 .pixel-map { display: block; cursor: grab; touch-action: none; }
 .pixel-map:active { cursor: grabbing; }
 .map-note {
-  position: absolute; top: 8px; left: 8px; right: 8px; margin: 0; z-index: 2; width: max-content; max-width: calc(100% - 16px);
+  position: absolute; top: 8px; left: 8px; right: 8px; margin: 0; z-index: 2; width: max-content; max-width: calc(100% - 64px);
   background: var(--panel); color: var(--muted); border: 2px solid var(--edge); box-shadow: var(--shadow-sm);
   padding: .25rem .5rem; font-size: 8px; line-height: 2;
 }
@@ -716,6 +716,30 @@ dialog.closing::backdrop { animation: ef-fade-out .16s steps(3, end) forwards; }
 .legend-item { display: inline-flex; align-items: center; white-space: nowrap; }
 .map-info { color: #111; font-family: var(--mono); display: flex; flex-direction: column; gap: 4px; font-size: 12px; max-width: 260px; }
 .map-info .btn { align-self: flex-start; margin-top: 4px; box-shadow: none; }
+
+/* fullscreen map: the map container covers the whole window (app.js also asks
+   the browser for real fullscreen where supported) */
+.map-fs-btn {
+  position: absolute; top: 8px; right: 8px; z-index: 3;
+  background: var(--panel); border-color: var(--edge); box-shadow: var(--shadow-sm);
+}
+.map-fs-btn svg { display: block; }
+.map-fs-btn .ico-exit { display: none; }
+.map-fs-btn[aria-pressed="true"] .ico-enter { display: none; }
+.map-fs-btn[aria-pressed="true"] .ico-exit { display: block; }
+.map-wrap.fullscreen {
+  position: fixed; inset: 0; z-index: 8; width: auto; height: auto; min-height: 0; border: 0;
+}
+.map-wrap.fullscreen .map-fs-btn {
+  top: calc(8px + env(safe-area-inset-top, 0px)); right: calc(8px + env(safe-area-inset-right, 0px));
+}
+.map-wrap.fullscreen .map-note {
+  top: calc(8px + env(safe-area-inset-top, 0px)); left: calc(8px + env(safe-area-inset-left, 0px));
+}
+.map-wrap.fullscreen .legend {
+  bottom: calc(28px + env(safe-area-inset-bottom, 0px)); left: calc(8px + env(safe-area-inset-left, 0px));
+}
+body.map-fullscreen { overflow: hidden; }
 
 .stats-panel { padding: .9rem; display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
 @media (min-width: 1200px) {

@@ -80,6 +80,11 @@ The Content-Security-Policy allows exactly the Google Maps origins. Without a
 key (or if the key is rejected) a canvas "pixel map" in Web Mercator draws the
 same data with pan, zoom and click-to-select.
 
+The fullscreen button stretches the map container over the whole window and,
+where the browser supports it, also requests native fullscreen (iPhones,
+which lack element fullscreen, get the window-filling mode only). Google's own
+fullscreen control is turned off so the legend and notes stay visible.
+
 ## Security
 
 - bcrypt password hashes, opaque session tokens (only their SHA-256 is stored)

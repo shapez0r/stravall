@@ -11,7 +11,7 @@ look: one static Go binary with the web UI embedded, SQLite on a laptop or
 MariaDB + Valkey when scaled out, and the same colour themes. It listens on
 port **8082**.
 
-- 🗺️ All routes on Google Maps (or on the built-in offline pixel map when no API key is set), coloured by sport, with start ■ and finish ● markers you can switch off
+- 🗺️ All routes on Google Maps (or on the built-in offline pixel map when no API key is set), coloured by sport, with start ■ and finish ● markers you can switch off, and a fullscreen map mode on desktop and mobile
 - 🔎 Click a route on the map, in the list or in the table to highlight it and open its details; everything else is dimmed
 - 📊 Per activity: distance, moving and elapsed time, average pace or speed, max speed, elevation gain/loss, min/max elevation, heart rate, cadence, power, temperature, calories, start/finish coordinates (loop detection), elevation profile and splits per km or mile
 - 📈 Combined, for whatever is filtered (sport, date range, name search): totals, averages, per-week figures, active days and longest streak, records (longest, longest time, fastest, top speed, most climbing, highest point), breakdowns by sport, by year, distance per month and per weekday, and a sortable table of all activities
@@ -77,6 +77,9 @@ pan, wheel or pinch to zoom, click a route to select it). For Google Maps:
 The key is handed to the browser (that is how the Maps JavaScript API works),
 so always restrict it by referrer. If Google rejects the key, the UI falls
 back to the pixel map and says so.
+
+On desktop and mobile, the button in the map's top-right corner shows either
+map fullscreen; press it again (or Esc) to return.
 
 ## Updating
 
