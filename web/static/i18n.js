@@ -14,6 +14,7 @@
     en: {
       "doc.title": "Stravall — all your routes",
       "auth.tagline": "Upload your Strava exports and see all your routes and statistics on one map.",
+      "auth.model": "Built with Microsoft Copilot (model: Claude Opus 5.5).",
       "auth.signIn": "Sign in",
       "auth.createAccount": "Create account",
       "auth.displayName": "Display name",
@@ -191,6 +192,7 @@
     ru: {
       "doc.title": "Stravall — все ваши маршруты",
       "auth.tagline": "Загрузите экспорт из Strava и смотрите все маршруты и статистику на одной карте.",
+      "auth.model": "Создано с помощью Microsoft Copilot (модель: Claude Opus 5.5).",
       "auth.signIn": "Войти",
       "auth.createAccount": "Создать аккаунт",
       "auth.displayName": "Имя",
@@ -389,6 +391,7 @@
     es: {
       "doc.title": "Stravall — todas tus rutas",
       "auth.tagline": "Sube tus exportaciones de Strava y mira todas tus rutas y estadísticas en un solo mapa.",
+      "auth.model": "Creado con Microsoft Copilot (modelo: Claude Opus 5.5).",
       "auth.signIn": "Iniciar sesión",
       "auth.createAccount": "Crear cuenta",
       "auth.displayName": "Nombre visible",

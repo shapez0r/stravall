@@ -80,7 +80,7 @@ back to the pixel map and says so.
 
 ## Updating
 
-Your data is kept across updates (Docker volume, `./data` or
+Your data is kept across updates (Docker volume, `./data`, `~/.local/share/stravall` or
 `/var/lib/stravall`); database migrations run automatically on start.
 
 - **Docker:** `docker compose up -d --build`
@@ -138,9 +138,14 @@ stravall version
 ## Development
 
 ```sh
-make run      # build and start on :8082
+make run      # build and start on :8082 in the foreground
 make test     # unit tests (parsers for GPX/TCX/FIT/CSV/zip and the statistics engine)
 ```
+
+`make run` stores its data outside the repository in `~/.local/share/stravall`
+(override with `DATA_DIR=...` or `STRAVALL_DATA_DIR`) and reads settings such as
+`STRAVALL_GOOGLE_MAPS_KEY` from `~/.config/stravall/stravall.env` when that file
+exists (override with `ENV_FILE=...`).
 
 The web UI is plain HTML/CSS/JavaScript in `web/static/` (no build step),
 embedded into the binary with `go:embed`. See
